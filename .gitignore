@@ -1,0 +1,16 @@
+**/__pycache__/
+*.py[cod]
+.venv*/
+myenv/
+awg/files/
+awg/users/
+*.sqlite3*
+*.conf
+*.key
+*.pem
+.env
+.env.*
+dist/
+preview/
+.DS_Store
+.venvs/
