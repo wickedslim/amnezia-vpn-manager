@@ -1,0 +1,32 @@
+const tg = window.Telegram?.WebApp;
+const key = `amnezia-ui:${tg?.initDataUnsafe?.user?.id || 'preview'}:v1`;
+const dark = matchMedia('(prefers-color-scheme:dark)');
+const reduced = matchMedia('(prefers-reduced-motion:reduce)');
+export const defaults = {version:1,mode:'auto',palette:'brand',customAccent:'#FF4302',density:'comfortable',fontSize:14,motion:true};
+export function normalize(v={}) {return {...defaults,mode:['light','dark','auto'].includes(v.mode)?v.mode:'auto',palette:['brand','lime','pink','custom'].includes(v.palette)?v.palette:'brand',customAccent:/^#[0-9a-f]{6}$/i.test(v.customAccent||'')?v.customAccent.toUpperCase():'#FF4302',density:v.density==='compact'?'compact':'comfortable',fontSize:[12,14,16].includes(v.fontSize)?v.fontSize:14,motion:v.motion!==false}}
+let initial;try{initial=JSON.parse(localStorage.getItem(key))}catch{}
+export let preferences=normalize(initial||{mode:localStorage.getItem('amnezia-theme')||'auto'});
+let draft=null,saveBusy=false;
+const hex=c=>[1,3,5].map(i=>parseInt(c.slice(i,i+2),16));
+const luminance=c=>c.map(n=>{n/=255;return n<=.04045?n/12.92:((n+.055)/1.055)**2.4}).reduce((a,n,i)=>a+n*[.2126,.7152,.0722][i],0);
+const contrast=(a,b)=>(Math.max(luminance(a),luminance(b))+.05)/(Math.min(luminance(a),luminance(b))+.05);
+function readable(c,bg,isDark){let n=0;while(contrast(c,bg)<4.5&&n++<40)c=c.map(v=>isDark?v+(255-v)*.12:v*.85);return '#'+c.map(v=>Math.round(v).toString(16).padStart(2,'0')).join('')}
+export function applyPreferences(p=draft||preferences){
+ const root=document.documentElement,isDark=p.mode==='dark'||p.mode==='auto'&&(tg?.initData?tg.colorScheme==='dark':dark.matches);
+ root.dataset.theme=isDark?'dark':'light';root.dataset.density=p.density;root.dataset.motion=p.motion&&!reduced.matches?'on':'off';
+ const accent={brand:'#FF4302',lime:'#C5F35B',pink:'#FF7CAF',custom:p.customAccent}[p.palette],rgb=hex(accent);
+ const on=accent==='#FF4302'?'#FFFFFF':contrast(rgb,[22,22,22])>contrast(rgb,[255,255,255])?'#161616':'#FFFFFF';
+ root.style.setProperty('--brand-color',accent);root.style.setProperty('--accent-text',readable(rgb,hex(isDark?'#202020':'#FFFFFF'),isDark));root.style.setProperty('--accent-on',on);root.style.setProperty('--orange-soft',`rgba(${rgb.join(',')},${isDark?'.16':'.10'})`);root.style.setProperty('--text-scale',String(p.fontSize/14));
+ // Explicit user themes override Telegram palette; auto follows its color scheme.
+ for(const [k,v] of Object.entries(isDark?{'bg-color':'#111111','text-color':'#f5f5f5','hint-color':'#a1a1aa','secondary-bg-color':'#202020'}:{'bg-color':'#ffffff','text-color':'#18181b','hint-color':'#66666f','secondary-bg-color':'#f4f4f5'}))root.style.setProperty(`--tg-theme-${k}`,v);
+}
+export const motionAllowed=()=>document.documentElement.dataset.motion==='on';
+export async function loadPreferences(api){try{preferences=normalize(await api('/preferences'));try{localStorage.setItem(key,JSON.stringify(preferences))}catch{}applyPreferences()}catch{applyPreferences()}}
+export function beginPreferences(){draft={...preferences}}
+export function cancelPreferences(){draft=null;applyPreferences()}
+export function settingsScreen(){const p=draft||preferences;const seg=(field,items)=>`<div class="preference-segment" role="group" aria-label="${field==='mode'?'Тема':field==='density'?'Плотность':'Размер текста'}">${items.map(([v,label])=>`<button type="button" data-pref="${field}" data-value="${v}" aria-pressed="${String(p[field])===String(v)}">${label}</button>`).join('')}</div>`;return `<div class="page-heading"><div><h1>Настройки</h1><p class="subtitle">Вид и поведение вашей панели</p></div></div><form id="preferences-form"><section class="surface settings-section"><h2>Оформление</h2><div class="palette-grid" role="group" aria-label="Цветовая схема">${[['brand','Фирменная','#FF4302'],['lime','Салатовая','#C5F35B'],['pink','Розовая','#FF7CAF'],['custom','Свой цвет',p.customAccent]].map(([v,label,color])=>`<button type="button" data-pref="palette" data-value="${v}" aria-pressed="${p.palette===v}"><i style="background:${color}"></i>${label}</button>`).join('')}</div><label class="custom-accent" ${p.palette==='custom'?'':'hidden'}>Акцентный цвет<input type="color" id="accent-color" value="${p.customAccent}" aria-label="Акцентный цвет"></label><div class="preference-row"><span>Тема</span>${seg('mode',[['light','Светлая'],['dark','Тёмная'],['auto','Системная']])}</div></section><section class="surface settings-section"><h2>Вид</h2><div class="preference-row"><span>Плотность</span>${seg('density',[['comfortable','Обычная'],['compact','Компактная']])}</div><div class="preference-row"><span>Размер текста</span>${seg('fontSize',[[12,'Меньше'],[14,'Обычный'],[16,'Больше']])}</div><label class="motion-row"><span><b>Анимация</b><small>Плавные переходы, нажатия и графики</small></span><input id="motion-toggle" type="checkbox" role="switch" ${p.motion?'checked':''}></label><p class="footnote">Системное «Уменьшить движение» имеет приоритет.${reduced.matches?' Сейчас анимации отключены системой.':''}</p></section><p class="footnote">Настройки сохраняются для владельца этого бота. Выбор можно оценить до сохранения; «Отмена» вернёт прежний вид.</p><div id="preferences-error" class="footnote danger" role="alert"></div><div class="settings-actions"><button type="button" class="secondary" data-pref-reset>По умолчанию</button><button type="button" class="secondary" data-pref-cancel>Отмена</button><button class="primary" type="submit">Сохранить настройки</button></div></form>`}
+export function changePreference(field,value){draft=normalize({...draft||preferences,[field]:field==='fontSize'?Number(value):value});applyPreferences(draft)}
+export function resetPreferences(){draft={...defaults};applyPreferences(draft)}
+export async function savePreferences(api){if(saveBusy)return;saveBusy=true;try{const result=await api('/preferences',{method:'POST',body:JSON.stringify(draft||preferences)});preferences=normalize(result);try{localStorage.setItem(key,JSON.stringify(preferences))}catch{}draft=null;applyPreferences();}finally{saveBusy=false}}
+for(const media of [dark,reduced])media.addEventListener('change',()=>applyPreferences());
+applyPreferences();
