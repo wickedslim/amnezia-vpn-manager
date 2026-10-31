@@ -132,3 +132,25 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ManagerError):
                 with InstanceLock("123:fake-token-for-test"):
                     self.fail("duplicate instance")
+
+    async def test_reissue_requires_confirmation_sends_file_and_can_redownload(self):
+        s=self.store.add_server(Server(0,'server',host='test'))
+        self.store.sync(s.id,[Peer('old-key','phone','10.0.0.2/32','')],'server-key')
+        c=self.store.clients(s.id)[0]
+        self.bot.send_document=AsyncMock()
+        async def rotate(sid,cid,key):
+            self.store.save_client_config(sid,key,'[Interface]\nPrivateKey = TEST\n')
+            return self.store.client(sid,cid)
+        self.service.reissue_client=AsyncMock(side_effect=rotate)
+        await self.ui.callback(SimpleNamespace(data=f'reissue:{s.id}:{c["id"]}'))
+        self.service.reissue_client.assert_not_awaited()
+        markup=self.bot.send_message.call_args.kwargs['reply_markup']
+        data=markup.inline_keyboard[0][0].callback_data
+        await self.ui.callback(SimpleNamespace(data=data))
+        self.service.reissue_client.assert_awaited_once_with(s.id,c['id'],'old-key')
+        file=self.bot.send_document.call_args.args[1]
+        self.assertEqual(file.data,b'[Interface]\nPrivateKey = TEST\n')
+        await self.ui.callback(SimpleNamespace(data=data))
+        self.assertEqual(self.service.reissue_client.await_count,1)
+        await self.ui.callback(SimpleNamespace(data=f'conf:{s.id}:{c["id"]}'))
+        self.assertEqual(self.bot.send_document.call_args.args[1].data,file.data)

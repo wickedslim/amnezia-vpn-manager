@@ -64,6 +64,9 @@ elif args[0] == "set":
         (root / "fail_once").unlink()
         sys.exit(2)
     key = args[3]
+    if args[4] != "remove" and (root / "fail_add_once").exists():
+        (root / "fail_add_once").unlink()
+        sys.exit(2)
     if args[4] == "remove":
         state["peers"].pop(key, None)
     else:

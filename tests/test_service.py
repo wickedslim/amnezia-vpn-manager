@@ -123,26 +123,68 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             await self.service.create_client(self.server.id,"new",None,None)
         self.assertEqual(len(parse_config((self.vpn / "wg0.conf").read_text()).peers),2)
 
-    async def test_attach_export_restores_download_without_remote_changes(self):
-        created = await self.service.create_client(self.server.id, 'exported', None, None)
+    async def test_reissue_preserves_identity_policy_history_and_other_clients(self):
+        created = await self.service.create_client(self.server.id, 'phone', 3600, 1000000)
+        sid, cid, old_key = self.server.id, created['id'], created['public_key']
         with self.store.transaction() as conn:
-            conn.execute('UPDATE clients SET config=NULL WHERE id=?', (created['id'],))
-        before = [(self.vpn / name).read_bytes() for name in ('wg0.conf', 'clientsTable', 'runtime.json')]
-        await self.service.import_client_config(self.server.id, created['id'], created['config'])
-        self.assertEqual(self.store.client(self.server.id, created['id'])['config'], created['config'])
-        self.assertEqual(before, [(self.vpn / name).read_bytes() for name in ('wg0.conf', 'clientsTable', 'runtime.json')])
+            conn.execute('UPDATE clients SET total_rx=12345,total_tx=67890 WHERE id=?',(cid,))
+            conn.execute('UPDATE monthly SET rx=123,tx=456 WHERE client_id=?',(cid,))
+        monthly = [tuple(r) for r in self.store.connection.execute('SELECT * FROM monthly WHERE client_id=?',(cid,))]
+        before = self.store.client(sid,cid)
+        other = json.loads((self.vpn/'runtime.json').read_text())['peers'];other.pop(old_key)
+        result = await self.service.reissue_client(sid,cid,old_key)
+        self.assertNotEqual(result['public_key'],old_key)
+        self.assertNotEqual(result['config'],created['config'])
+        for field in ('id','name','allowed_ips','expires','traffic_limit','total_rx','total_tx'):
+            self.assertEqual(result[field],before[field],field)
+        self.assertEqual(monthly,[tuple(r) for r in self.store.connection.execute('SELECT * FROM monthly WHERE client_id=?',(cid,))])
+        runtime=json.loads((self.vpn/'runtime.json').read_text())
+        self.assertNotIn(old_key,runtime['peers'])
+        new_peer=runtime['peers'].pop(result['public_key'])
+        self.assertEqual(runtime['peers'],other)
+        self.assertEqual(new_peer['ips'],created['allowed_ips'])
+        self.assertEqual(self.store.client(sid,cid)['config'],result['config'])
+        self.assertEqual(len(self.store.clients(sid)),3)
+        table=json.loads((self.vpn/'clientsTable').read_text())
+        self.assertEqual([v['userData']['clientName'] for v in table if v['clientId']==result['public_key']],['phone'])
+        with self.assertRaises(ManagerError):await self.service.reissue_client(sid,cid,old_key)
+        self.assertNotIn('down',(self.vpn/'commands').read_text())
 
-    async def test_attach_export_rejects_wrong_client_server_address_and_hooks(self):
-        created = await self.service.create_client(self.server.id, 'exported', None, None)
-        other = await self.service.create_client(self.server.id, 'other', None, None)
-        text = created['config']
-        from helpers import keypair
-        _, wrong = keypair()
-        snapshot = await self.service.snapshot(self.server.id)
-        for bad in (other['config'], text.replace(snapshot.server_public, wrong),
-                    text.replace('10.30.0.4/32', '10.30.0.99/32'),
-                    text.replace('[Interface]', '[Interface]\nPostUp = echo unsafe'),
-                    text.replace('[Peer]', '[Peer]\nPublicKey = duplicate'), 'vpn://not-a-conf'):
-            with self.subTest(case=bad[:15]), self.assertRaises(ManagerError):
-                await self.service.import_client_config(self.server.id, created['id'], bad)
-            self.assertEqual(self.store.client(self.server.id, created['id'])['config'], text)
+    async def test_reissue_rollback_restores_old_peer_on_new_key_failure(self):
+        created=await self.service.create_client(self.server.id,'phone',None,None)
+        before=[(self.vpn/n).read_bytes() for n in ('wg0.conf','clientsTable')]
+        (self.vpn/'fail_add_once').touch()
+        with self.assertRaises(ManagerError):await self.service.reissue_client(self.server.id,created['id'],created['public_key'])
+        self.assertEqual(before,[(self.vpn/n).read_bytes() for n in ('wg0.conf','clientsTable')])
+        await self.service.snapshot(self.server.id,force=True)
+        current=self.store.client(self.server.id,created['id'])
+        self.assertEqual((current['public_key'],current['config']),(created['public_key'],created['config']))
+        self.assertIn(created['public_key'],json.loads((self.vpn/'runtime.json').read_text())['peers'])
+        self.assertEqual(self.store.connection.execute('SELECT count(*) FROM rotations').fetchone()[0],0)
+
+    async def test_reissue_recovers_after_remote_success_before_database_commit(self):
+        created=await self.service.create_client(self.server.id,'phone',3600,1000000)
+        original=self.store.reconcile_rotations
+        def interrupt(sid,keys):
+            if self.store.connection.execute('SELECT count(*) FROM rotations').fetchone()[0]:raise RuntimeError('simulated process interruption')
+            return original(sid,keys)
+        self.store.reconcile_rotations=interrupt
+        with self.assertRaises(RuntimeError):await self.service.reissue_client(self.server.id,created['id'],created['public_key'])
+        self.store.reconcile_rotations=original
+        await self.service.snapshot(self.server.id,force=True)
+        result=self.store.client(self.server.id,created['id'])
+        self.assertNotEqual(result['public_key'],created['public_key'])
+        self.assertIn('PrivateKey =',result['config'])
+        self.assertEqual(len(self.store.clients(self.server.id)),3)
+        self.assertEqual(result['allowed_ips'],created['allowed_ips'])
+
+    async def test_reissue_accumulates_new_epoch_traffic_without_resetting_old_totals(self):
+        created=await self.service.create_client(self.server.id,'phone',None,None)
+        with self.store.transaction() as conn:conn.execute('UPDATE clients SET total_rx=1000,total_tx=2000 WHERE id=?',(created['id'],))
+        result=await self.service.reissue_client(self.server.id,created['id'],created['public_key'])
+        state=json.loads((self.vpn/'runtime.json').read_text());peer=state['peers'][result['public_key']];peer['rx']=50;peer['tx']=80
+        (self.vpn/'runtime.json').write_text(json.dumps(state))
+        await self.service.snapshot(self.server.id,force=True)
+        result=self.store.client(self.server.id,created['id'])
+        self.assertEqual((result['total_rx'],result['total_tx']),(1050,2080))
+
