@@ -21,6 +21,7 @@ from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from .domain import ManagerError, Server, validate_name
 from .service import VPNService
+from .reissue import Reissues
 from .store import Store
 from .views import ago, client_text, e, keyboard, rates, size, sparkline
 
@@ -84,6 +85,7 @@ class UI:
         self.wizard_lock = asyncio.Lock()
         self.panel_lock = asyncio.Lock()
         self.revision = 0
+        self.reissues = Reissues(store, service)
 
     async def panel(self, text, markup, revision=None):
         async with self.panel_lock:
@@ -207,7 +209,7 @@ class UI:
         server = self.store.server(sid)
         await self.service.snapshot(sid, force)
         client = self.store.client(sid, cid)
-        await self.panel(client_text(server.name, client), keyboard([("Получить конфигурацию", f"conf:{sid}:{cid}")], [("↻ Обновить", f"cr:{sid}:{cid}"), ("Лимиты и срок", f"policy:{sid}:{cid}")], [("IP подключения", f"ip:{sid}:{cid}"), ("Удалить", f"delete:{sid}:{cid}")], [("‹ Клиенты", f"list:{sid}:0"), ("⌂ Главная", "home")]), revision)
+        await self.panel(client_text(server.name, client), keyboard([("Получить конфигурацию", f"conf:{sid}:{cid}")], [("Перевыпустить конфиг", f"reissue:{sid}:{cid}")], [("↻ Обновить", f"cr:{sid}:{cid}"), ("Лимиты и срок", f"policy:{sid}:{cid}")], [("IP подключения", f"ip:{sid}:{cid}"), ("Удалить", f"delete:{sid}:{cid}")], [("‹ Клиенты", f"list:{sid}:0"), ("⌂ Главная", "home")]), revision)
 
     async def callback(self, call: CallbackQuery):
         self.revision += 1
@@ -262,6 +264,16 @@ class UI:
             elif action == "unlinkyes":
                 await self.service.disconnect_server(int(parts[1]))
                 await self.home(revision)
+            elif action == "reissue":
+                sid, cid = map(int, parts[1:3])
+                confirmation = self.reissues.prepare(sid, cid)
+                await self.panel(f"<b>Перевыпустить конфиг?</b>\n\nСервер: {e(confirmation['server'])}\nКлиент: <b>{e(confirmation['name'])}</b>\n\nСтарый конфиг перестанет работать. Имя, VPN-адрес, лимиты, срок и статистика сохранятся. Новый файл можно будет скачать повторно без перевыпуска.", keyboard([("Перевыпустить", f"reissueyes:{sid}:{cid}:{confirmation['nonce']}")], [("Отмена", f"c:{sid}:{cid}")]), revision)
+            elif action == "reissueyes":
+                sid, cid = map(int, parts[1:3])
+                client = await self.reissues.execute(sid, cid, parts[3])
+                filename = re.sub(r"[^\w.-]", "_", client['name'])[:40] or str(cid)
+                await self.bot.send_document(self.admin_id, BufferedInputFile(client['config'].encode(), filename=f"{filename}.conf"), caption=f"{e(client['name'])} · новый конфиг. Старый отключён. Файл сохранён для повторного скачивания.")
+                await self.client(sid, cid, revision=revision)
             elif action == "delete":
                 sid, cid = map(int, parts[1:3])
                 client = self.store.client(sid, cid)
@@ -277,7 +289,7 @@ class UI:
                 client = self.store.client(sid, cid)
                 text = client["config"]
                 if not text:
-                    raise ManagerError("Приватный ключ этого клиента не сохранён у бота. Конфигурацию можно взять на устройстве, где клиент был создан. Автоматически восстановить приватный ключ с VPN-сервера нельзя.")
+                    raise ManagerError("Сохранённого конфига пока нет. Нажмите «Перевыпустить конфиг»: новый файл сохранится для повторной выдачи, старый перестанет работать.")
                 filename = re.sub(r"[^\w.-]", "_", client["name"])[:40] or str(cid)
                 await self.bot.send_document(self.admin_id, BufferedInputFile(text.encode(), filename=f"{filename}.conf"), caption=f"{e(self.store.server(sid).name)} · {e(client['name'])}")
                 raw = text.encode()

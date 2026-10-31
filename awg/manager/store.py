@@ -36,6 +36,9 @@ class Store:
                 total_tx INTEGER NOT NULL DEFAULT 0, last_rx INTEGER, last_tx INTEGER,
                 handshake INTEGER NOT NULL DEFAULT 0, endpoint TEXT NOT NULL DEFAULT '', present INTEGER NOT NULL DEFAULT 1,
                 UNIQUE(server_id, public_key));
+            CREATE TABLE IF NOT EXISTS rotations (
+                client_id INTEGER PRIMARY KEY REFERENCES clients(id) ON DELETE CASCADE,
+                old_key TEXT NOT NULL, new_key TEXT NOT NULL, config TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS wizards (user_id INTEGER PRIMARY KEY, value TEXT NOT NULL, updated REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS legacy_configs (public_key TEXT PRIMARY KEY, config TEXT NOT NULL);
@@ -156,6 +159,26 @@ class Store:
         self.client(sid, cid)
         with self.transaction() as conn:
             conn.execute("UPDATE clients SET expires=?,traffic_limit=? WHERE server_id=? AND id=?", (expires, limit, sid, cid))
+
+    def prepare_rotation(self, sid: int, cid: int, old_key: str, new_key: str, config: str):
+        client = self.client(sid, cid)
+        if client['public_key'] != old_key:
+            raise ManagerError('Конфиг уже изменился. Откройте карточку заново.')
+        with self.transaction() as conn:
+            conn.execute('INSERT INTO rotations VALUES (?,?,?,?)', (cid, old_key, new_key, config))
+
+    def reconcile_rotations(self, sid: int, keys: set[str]):
+        # Durable journal: a process crash after remote replacement must not create a
+        # second client or lose its saved private key / accounting identity.
+        with self.transaction() as conn:
+            pending = conn.execute('SELECT r.* FROM rotations r JOIN clients c ON c.id=r.client_id WHERE c.server_id=?', (sid,)).fetchall()
+            for item in pending:
+                old, new = item['old_key'] in keys, item['new_key'] in keys
+                if new and not old:
+                    conn.execute('UPDATE clients SET public_key=?,config=?,last_rx=0,last_tx=0,handshake=0,endpoint=? WHERE id=?', (item['new_key'], item['config'], '', item['client_id']))
+                elif not old or new:
+                    raise ManagerError('Не удалось однозначно проверить перевыпуск. Обновите связь с сервером; повторный перевыпуск пока остановлен.')
+                conn.execute('DELETE FROM rotations WHERE client_id=?', (item['client_id'],))
 
     def save_client_config(self, sid: int, key: str, config: str):
         with self.transaction() as conn:

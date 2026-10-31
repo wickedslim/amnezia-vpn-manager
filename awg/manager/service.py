@@ -80,6 +80,7 @@ class VPNService:
             for key, value in peers.get(peer.public_key, {}).items():
                 setattr(peer, key, value)
         snapshot = Snapshot(config, text, table_text, table, public, time.time())
+        self.store.reconcile_rotations(sid, {p.public_key for p in config.peers})
         self.store.sync(sid, config.peers, public)
         self.store.set_pref(f"health:{sid}", {"ok": True, "updated": snapshot.timestamp})
         self.cache[sid] = snapshot
@@ -184,19 +185,52 @@ printf '%s\\n' "$private" | "$WG" pubkey
             self.store.remove_server(sid)
             self.cache.pop(sid, None)
 
-    async def import_client_config(self, sid: int, cid: int, text: str):
-        from .config_import import validate_client_export
+    async def reissue_client(self, sid: int, cid: int, expected_key: str) -> dict:
         async with self.lock(sid):
             def operation():
                 snapshot = self._read(sid)
                 client = self.store.client(sid, cid)
-                peer = next((p for p in snapshot.config.peers if p.public_key == client['public_key']), None)
-                if peer is None:
+                if client['public_key'] != expected_key:
+                    raise ManagerError('Конфиг уже перевыпущен или изменён. Откройте карточку заново.')
+                if (client['expires'] is not None and client['expires'] <= time.time()
+                        or client['traffic_limit'] is not None and client['total_rx'] + client['total_tx'] >= client['traffic_limit']):
+                    raise ManagerError('Срок или лимит клиента исчерпан. Сначала измените ограничения.')
+                peer = next((p for p in snapshot.config.peers if p.public_key == expected_key), None)
+                if not peer:
                     raise ManagerError('Клиент больше не существует на сервере.')
-                config = validate_client_export(text, peer, snapshot.server_public)
-                with self.store.transaction() as conn:
-                    conn.execute('UPDATE clients SET config=? WHERE id=? AND server_id=? AND present=1', (config, cid, sid))
-            await self.worker(operation)
+                server = self.store.server(sid)
+                if not server.endpoint:
+                    raise ManagerError('У сервера не задан внешний адрес для клиентской конфигурации.')
+                runner = self.runner(sid)
+                keys = runner.docker(f"""set -eu
+{WG_SELECT}
+private=$("$WG" genkey)
+printf '%s\\n' "$private"
+printf '%s\\n' "$private" | "$WG" pubkey
+"$WG" genpsk
+""").splitlines()
+                if len(keys) != 3:
+                    raise ManagerError('Не удалось сгенерировать ключи клиента.')
+                private, public, psk = map(validate_key, keys)
+                generated = client_config(snapshot.config, peer.allowed_ips, private, snapshot.server_public, psk, server.endpoint)
+                # Keep all peer options, replacing only its cryptographic identity.
+                block = re.sub(r'(?m)^(\s*PublicKey\s*=)[^\n]*', lambda m: m[1] + ' ' + public, peer.block)
+                block = re.sub(r'(?m)^\s*PresharedKey\s*=[^\n]*\n?', '', block)
+                block = block.rstrip() + '\nPresharedKey = ' + psk + '\n'
+                from dataclasses import replace
+                replacement = replace(peer, public_key=public, block=block)
+                peers = [replacement if p.public_key == expected_key else p for p in snapshot.config.peers]
+                table = [{**entry, 'clientId': public} if entry['clientId'] == expected_key else entry for entry in snapshot.table]
+                self.store.prepare_rotation(sid, cid, expected_key, public, generated)
+                try:
+                    write_peer(runner, before=snapshot.text, after=snapshot.config.render(peers), table_before=snapshot.table_text,
+                               table_after=json.dumps(table, ensure_ascii=False), interface=Path(server.config_path).stem,
+                               key=public, allowed_ips=peer.allowed_ips, psk=psk, replace_key=expected_key, old_peer=peer.block)
+                finally:
+                    self.cache.pop(sid, None)
+                self._read(sid)
+                return self.store.client(sid, cid)
+            return await self.worker(operation)
 
     async def update_server(self, server: Server):
         async with self.lock(server.id):

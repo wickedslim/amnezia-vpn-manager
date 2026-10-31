@@ -14,6 +14,7 @@ from urllib.parse import parse_qsl
 from aiohttp import web
 
 from .reboot import Reboots
+from .reissue import Reissues
 from .preferences import normalize_preferences
 from .domain import ManagerError
 from .views import rates
@@ -73,6 +74,7 @@ class MiniApp:
         self.speedtests = Speedtests(store, service)
         self.hoststats = HostStats(store, service)
         self.reboots = Reboots(store, service)
+        self.reissues = Reissues(store, service)
 
     async def prepare_reboot(self, request):
         return web.json_response(self.reboots.prepare(int(request.match_info['sid'])))
@@ -155,12 +157,16 @@ class MiniApp:
             self.store.set_policy(sid, cid, expiry, limit)
         return web.json_response({'ok': True})
 
-    async def import_config(self, request):
+    async def prepare_reissue(self, request):
+        return web.json_response(self.reissues.prepare(int(request.match_info['sid']), int(request.match_info['cid'])))
+
+    async def reissue(self, request):
         body = await request.json()
-        if not isinstance(body, dict) or not isinstance(body.get('config'), str):
-            raise ManagerError('Выберите клиентский файл .conf.')
-        await self.service.import_client_config(int(request.match_info['sid']), int(request.match_info['cid']), body['config'])
-        return web.json_response({'ok': True})
+        if not isinstance(body, dict):
+            raise ManagerError('Подтвердите перевыпуск конфига.')
+        c = await self.reissues.execute(int(request.match_info['sid']), int(request.match_info['cid']), body.get('nonce'))
+        self.last_refresh = 0
+        return web.json_response({'config': c['config'], 'name': c['name']})
 
     async def config(self, request):
         c = self.store.client(int(request.match_info['sid']), int(request.match_info['cid']))
@@ -229,7 +235,8 @@ def create_web_app(settings, store, service):
     app.router.add_delete(r'/api/servers/{sid:\d+}/clients/{cid:\d+}', api.delete)
     app.router.add_patch(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/policy', api.set_policy)
     app.router.add_get(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/config', api.config)
-    app.router.add_post(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/config', api.import_config)
+    app.router.add_post(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/reissue/prepare', api.prepare_reissue)
+    app.router.add_post(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/reissue', api.reissue)
     return app
 
 
