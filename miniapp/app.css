@@ -44,3 +44,5 @@ dialog .toolbar>button{display:flex;align-items:center;justify-content:center;mi
 :root[data-motion=off] *,:root[data-motion=off] *:before,:root[data-motion=off] *:after{animation:none!important;transition:none!important;scroll-behavior:auto!important}
 :root[data-motion=off] :is(button,.client-card,.server-card):active{transform:none}
 @media(prefers-reduced-motion:reduce){:is(button,.client-card,.server-card):active,:is(button,.client-card,.server-card):hover{transform:none!important}}
+
+.reissue-button{margin-top:10px;min-height:44px}
