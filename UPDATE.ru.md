@@ -2,7 +2,19 @@
 
 Поддерживается стандартная установка старого `awg-docker-bot` со службой `awg_bot` и рабочей папкой, заканчивающейся на `/awg`, а также эта версия менеджера. Для нестандартной службы используйте `AWG_SERVICE_NAME`, для каталога — `AWG_INSTALL_DIR`.
 
-## Получить отдельную копию новой версии
+## Обновление одной командой
+
+```bash
+bash -c 'set -e; run_root() { if [ "$EUID" -eq 0 ]; then "$@"; else sudo "$@"; fi; }; command -v git >/dev/null || { run_root apt-get update; run_root apt-get install -y git ca-certificates; }; task_dir=$(mktemp -d); trap "rm -rf -- \"$task_dir\"" EXIT; git -c credential.helper= clone --depth 1 https://github.com/wickedslim/amnezia-vpn-manager.git "$task_dir"; run_root bash "$task_dir/update.sh"'
+```
+
+Команда скачивает актуальную ветку `main` в новую временную папку, запускает установщик и удаляет только эту временную копию после завершения. Если Git отсутствует, установит Git и сертификаты через apt. Запускайте в терминале VPS (Ubuntu/Debian); если вы не root, потребуется sudo.
+
+**Репозиторий приватный:** сначала примите приглашение. Git запросит GitHub-логин и `Password`: сюда вводится **личный access token GitHub**, а не пароль аккаунта и не токен Telegram-бота. Ввод скрытый; команда отключает сохранение токена через Git credential helper. Не вставляйте токен в URL или текст команды. Подробнее — [авторизация GitHub по HTTPS](https://docs.github.com/en/get-started/git-basics/about-remote-repositories#cloning-with-https-urls). Если на сервере уже настроен SSH-доступ к GitHub, замените HTTPS-адрес на `git@github.com:wickedslim/amnezia-vpn-manager.git`.
+
+Текущий режим (бот / бот с Mini App) сохранится. Скрипт создаст резервную копию перед заменой кода. Для отключения Mini App добавьте `--bot-only` после `"$task_dir/update.sh"` внутри одинарных кавычек. Если скачивание или авторизация завершатся ошибкой, установщик не запустится.
+
+## Получить отдельную копию новой версии вручную
 
 Скачайте свежий ZIP из приватного репозитория и распакуйте в **отдельную** папку. Не распаковывайте поверх рабочего каталога бота.
 
