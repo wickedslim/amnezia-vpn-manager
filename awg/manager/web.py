@@ -13,6 +13,8 @@ from urllib.parse import parse_qsl
 
 from aiohttp import web
 
+from .reboot import Reboots
+from .preferences import normalize_preferences
 from .domain import ManagerError
 from .views import rates
 from .speedtest import Speedtests
@@ -70,6 +72,26 @@ class MiniApp:
         self.last_refresh = 0.0
         self.speedtests = Speedtests(store, service)
         self.hoststats = HostStats(store, service)
+        self.reboots = Reboots(store, service)
+
+    async def prepare_reboot(self, request):
+        return web.json_response(self.reboots.prepare(int(request.match_info['sid'])))
+
+    async def reboot(self, request):
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ManagerError('Подтвердите перезагрузку сервера.')
+        result = await self.reboots.execute(int(request.match_info['sid']), body.get('nonce'), body.get('name'))
+        return web.json_response(result)
+
+    async def preferences(self, request):
+        key = f'ui_preferences:{self.settings.admin_id}'
+        if request.method == 'POST':
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise ManagerError('Проверьте настройки оформления.')
+            self.store.set_pref(key, normalize_preferences(body))
+        return web.json_response(normalize_preferences(self.store.get_pref(key, {})))
 
     async def overview(self, request):
         # Shared across tabs/users; forced reads at most once every five seconds.
@@ -133,6 +155,13 @@ class MiniApp:
             self.store.set_policy(sid, cid, expiry, limit)
         return web.json_response({'ok': True})
 
+    async def import_config(self, request):
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get('config'), str):
+            raise ManagerError('Выберите клиентский файл .conf.')
+        await self.service.import_client_config(int(request.match_info['sid']), int(request.match_info['cid']), body['config'])
+        return web.json_response({'ok': True})
+
     async def config(self, request):
         c = self.store.client(int(request.match_info['sid']), int(request.match_info['cid']))
         if not c['config']:
@@ -168,9 +197,13 @@ def create_web_app(settings, store, service):
         return web.FileResponse(STATIC / 'index.html')
     async def asset(request):
         name = request.match_info['name']
-        if name not in {'app.js', 'app.css'}:
+        if name not in {'app.js', 'app.css', 'preferences.js'}:
             raise web.HTTPNotFound()
         return web.FileResponse(STATIC / name)
+    app.router.add_post(r'/api/servers/{sid:\d+}/reboot/prepare', api.prepare_reboot)
+    app.router.add_post(r'/api/servers/{sid:\d+}/reboot', api.reboot)
+    app.router.add_get('/api/preferences', api.preferences)
+    app.router.add_post('/api/preferences', api.preferences)
     app.router.add_get('/', index)
     app.router.add_get('/assets/{name}', asset)
     app.router.add_get('/api/overview', api.overview)
@@ -196,6 +229,7 @@ def create_web_app(settings, store, service):
     app.router.add_delete(r'/api/servers/{sid:\d+}/clients/{cid:\d+}', api.delete)
     app.router.add_patch(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/policy', api.set_policy)
     app.router.add_get(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/config', api.config)
+    app.router.add_post(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/config', api.import_config)
     return app
 
 

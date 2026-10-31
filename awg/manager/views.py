@@ -18,8 +18,8 @@ def keyboard(*rows):
 
 def size(value: int | float) -> str:
     number = float(value)
-    for unit in ("Б", "КиБ", "МиБ", "ГиБ", "ТиБ"):
-        if abs(number) < 1024 or unit == "ТиБ":
+    for unit in ("Б", "Кб", "Мб", "Гб", "Тб"):
+        if abs(number) < 1024 or unit == "Тб":
             return f"{number:.1f} {unit}" if unit != "Б" else f"{number:.0f} Б"
         number /= 1024
 

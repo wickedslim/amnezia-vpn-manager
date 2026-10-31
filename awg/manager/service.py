@@ -184,6 +184,20 @@ printf '%s\\n' "$private" | "$WG" pubkey
             self.store.remove_server(sid)
             self.cache.pop(sid, None)
 
+    async def import_client_config(self, sid: int, cid: int, text: str):
+        from .config_import import validate_client_export
+        async with self.lock(sid):
+            def operation():
+                snapshot = self._read(sid)
+                client = self.store.client(sid, cid)
+                peer = next((p for p in snapshot.config.peers if p.public_key == client['public_key']), None)
+                if peer is None:
+                    raise ManagerError('Клиент больше не существует на сервере.')
+                config = validate_client_export(text, peer, snapshot.server_public)
+                with self.store.transaction() as conn:
+                    conn.execute('UPDATE clients SET config=? WHERE id=? AND server_id=? AND present=1', (config, cid, sid))
+            await self.worker(operation)
+
     async def update_server(self, server: Server):
         async with self.lock(server.id):
             await self.probe(server)
