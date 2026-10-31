@@ -1,0 +1,211 @@
+"""Same-process Mini App API. Optional; binds to loopback behind an HTTPS proxy."""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import hmac
+import json
+import logging
+import math
+import time
+from pathlib import Path
+from urllib.parse import parse_qsl
+
+from aiohttp import web
+
+from .domain import ManagerError
+from .views import rates
+from .speedtest import Speedtests
+from .hoststats import HostStats
+
+log = logging.getLogger(__name__)
+STATIC = Path(__file__).resolve().parents[2] / 'miniapp'
+
+
+def validate_init_data(raw: str, token: str, admin_id: int, now=None) -> int:
+    """Verify Telegram HMAC, bounded age and the configured administrator."""
+    try:
+        pairs = parse_qsl(raw, strict_parsing=True, max_num_fields=32)
+        values = dict(pairs)
+        if not raw or len(raw) > 16384 or len(values) != len(pairs):
+            raise ValueError
+        digest = values.pop('hash')
+        secret = hmac.new(b'WebAppData', token.encode(), hashlib.sha256).digest()
+        check = '\n'.join(f'{k}={v}' for k, v in sorted(values.items()))
+        expected = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, digest):
+            raise ValueError
+        age = (time.time() if now is None else now) - int(values['auth_date'])
+        if not -30 <= age <= 3600:
+            raise ValueError
+        uid = json.loads(values['user'])['id']
+        if type(uid) is not int or uid != admin_id:
+            raise ValueError
+        return uid
+    except (ValueError, KeyError, TypeError):
+        raise web.HTTPUnauthorized(text=json.dumps({'error': 'Откройте Mini App заново из бота. Доступ разрешён только администратору.'}, ensure_ascii=False), content_type='application/json') from None
+
+
+def client_json(c):
+    return dict(id=c['id'], name=c['name'], ip=c['allowed_ips'], rx=c['total_tx'], tx=c['total_rx'],
+                handshake=c['handshake'], online=bool(c['handshake'] and 0 <= time.time()-c['handshake'] <= 180),
+                limit=c['traffic_limit'], expires=c['expires'], has_config=bool(c['config']))
+
+
+def policy(body):
+    def number(key, maximum):
+        value = body.get(key)
+        if value is None:
+            return None
+        if type(value) not in (int, float) or not math.isfinite(value) or value <= 0 or value > maximum:
+            raise ManagerError('Укажите положительный срок и лимит или оставьте их пустыми.')
+        return int(value)
+    return number('duration', 10*365*86400), number('limit', 1024**4*1024)
+
+
+class MiniApp:
+    def __init__(self, settings, store, service):
+        self.settings, self.store, self.service = settings, store, service
+        self.refresh_lock = asyncio.Lock()
+        self.last_refresh = 0.0
+        self.speedtests = Speedtests(store, service)
+        self.hoststats = HostStats(store, service)
+
+    async def overview(self, request):
+        # Shared across tabs/users; forced reads at most once every five seconds.
+        async with self.refresh_lock:
+            if time.monotonic()-self.last_refresh >= 5:
+                await self.service.overview(force=True)
+                self.last_refresh = time.monotonic()
+        await self.hoststats.refresh()
+        servers = []
+        for s in self.store.servers():
+            health = self.store.get_pref(f'health:{s.id}', {})
+            samples = self.store.samples(s.id, 120)
+            rx, tx = rates(samples)
+            latest = samples[-1] if samples else {'rx': 0, 'tx': 0, 'ts': 0}
+            clients = [client_json(c) for c in self.store.clients(s.id)]
+            reachable = bool(health.get('ok'))
+            if not reachable:
+                for c in clients:
+                    c['online'] = False
+            servers.append(dict(id=s.id, name=s.name, ok=reachable, updated=latest['ts'], rx=latest['tx'], tx=latest['rx'],
+                                rate_rx=tx if reachable else 0, rate_tx=rx if reachable else 0,
+                                online=sum(c['online'] for c in clients), host_traffic=self.hoststats.get(s.id), clients=clients, samples=[{**p, "rx":p["tx"], "tx":p["rx"]} for p in samples]))
+        return web.json_response(dict(servers=servers, monthly_since=self.store.get_pref('monthly_since'), demo=False))
+
+    async def speedtest(self, request):
+        sid = int(request.match_info['sid'])
+        if request.method == 'GET':
+            return web.json_response(self.speedtests.status(sid))
+        body = await request.json()
+        return web.json_response(self.speedtests.start(sid, body.get('action')), status=202)
+
+    async def monthly(self, request):
+        sid = int(request.match_info['sid'])
+        self.store.server(sid)
+        rows = self.store.monthly_report(sid, request.query.get('month', ''), request.query.get('sort', 'total'))
+        return web.json_response({'clients': [dict(id=c['id'], name=c['name'], ip=c['allowed_ips'], rx=c['tx'], tx=c['rx'], deleted=not c['present']) for c in rows]})
+
+    async def create(self, request):
+        body = await request.json()
+        duration, limit = policy(body)
+        name = body.get('name')
+        if not isinstance(name, str):
+            raise ManagerError('Введите имя клиента.')
+        c = await self.service.create_client(int(request.match_info['sid']), name, duration, limit)
+        self.last_refresh = 0
+        return web.json_response(client_json(c), status=201)
+
+    async def delete(self, request):
+        await self.service.delete_client(int(request.match_info['sid']), int(request.match_info['cid']))
+        self.last_refresh = 0
+        return web.json_response({'ok': True})
+
+    async def set_policy(self, request):
+        sid, cid = int(request.match_info['sid']), int(request.match_info['cid'])
+        body = await request.json()
+        duration, limit = policy(body)
+        # Serialise with monitor/client deletion, using the same service lock.
+        async with self.service.lock(sid):
+            c = self.store.client(sid, cid)
+            expiry = c['expires'] if body.get('keep_expiry') is True else int(time.time())+duration if duration else None
+            self.store.set_policy(sid, cid, expiry, limit)
+        return web.json_response({'ok': True})
+
+    async def config(self, request):
+        c = self.store.client(int(request.match_info['sid']), int(request.match_info['cid']))
+        if not c['config']:
+            raise ManagerError('Приватный ключ этого клиента не сохранён в боте.')
+        return web.json_response({'config': c['config']})
+
+
+def create_web_app(settings, store, service):
+    api = MiniApp(settings, store, service)
+
+    @web.middleware
+    async def guard(request, handler):
+        try:
+            if request.path.startswith('/api/'):
+                auth = request.headers.get('Authorization', '')
+                validate_init_data(auth[4:] if auth.startswith('tma ') else '', settings.token, settings.admin_id)
+            response = await handler(request)
+        except ManagerError as exc:
+            response = web.json_response({'error': str(exc)}, status=400)
+        except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+            response = web.json_response({'error': 'Проверьте введённые данные.'}, status=400)
+        except web.HTTPException as exc:
+            response = exc
+        except Exception:
+            log.error('Ошибка Mini App API', exc_info=False)
+            response = web.json_response({'error': 'Не удалось выполнить запрос. Обновите данные и повторите.'}, status=500)
+        response.headers.update({'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
+            'Content-Security-Policy': "default-src 'self'; script-src 'self' https://telegram.org; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'"})
+        return response
+
+    app = web.Application(middlewares=[guard], client_max_size=16384)
+    async def index(request):
+        return web.FileResponse(STATIC / 'index.html')
+    async def asset(request):
+        name = request.match_info['name']
+        if name not in {'app.js', 'app.css'}:
+            raise web.HTTPNotFound()
+        return web.FileResponse(STATIC / name)
+    app.router.add_get('/', index)
+    app.router.add_get('/assets/{name}', asset)
+    app.router.add_get('/api/overview', api.overview)
+    app.router.add_get(r'/api/servers/{sid:\d+}/speedtest', api.speedtest)
+    app.router.add_post(r'/api/servers/{sid:\d+}/speedtest', api.speedtest)
+    host_task = None
+    async def host_monitor():
+        while True:
+            await api.hoststats.refresh()
+            await asyncio.sleep(60)
+    async def startup(app):
+        nonlocal host_task
+        host_task = asyncio.create_task(host_monitor())
+    async def cleanup(app):
+        if host_task:
+            host_task.cancel()
+            await asyncio.gather(host_task, return_exceptions=True)
+        await api.speedtests.close()
+    app.on_startup.append(startup)
+    app.on_cleanup.append(cleanup)
+    app.router.add_get(r'/api/servers/{sid:\d+}/monthly', api.monthly)
+    app.router.add_post(r'/api/servers/{sid:\d+}/clients', api.create)
+    app.router.add_delete(r'/api/servers/{sid:\d+}/clients/{cid:\d+}', api.delete)
+    app.router.add_patch(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/policy', api.set_policy)
+    app.router.add_get(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/config', api.config)
+    return app
+
+
+async def start_web(settings, store, service, host, port):
+    runner = web.AppRunner(create_web_app(settings, store, service), access_log=None)
+    await runner.setup()
+    try:
+        await web.TCPSite(runner, host, port).start()
+    except BaseException:
+        await runner.cleanup()
+        raise
+    log.info('Mini App: HTTP на %s:%d (требуется HTTPS-прокси)', host, port)
+    return runner
