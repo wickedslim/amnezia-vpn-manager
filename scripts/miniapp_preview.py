@@ -79,6 +79,13 @@ def create_demo():
             c=next(c for c in store.clients(sid) if c['public_key']==key)
             store.set_policy(sid,c['id'],int(time.time())+duration if duration else None,limit)
             return store.client(sid,c['id'])
+        async def reissue_client(self,sid,cid,expected_key):
+            from manager.domain import ManagerError
+            c=store.client(sid,cid)
+            if c['public_key']!=expected_key:raise ManagerError('Конфиг уже изменился. Откройте карточку заново.')
+            config='# ДЕМОНСТРАЦИОННЫЙ ФАЙЛ: не подключается к VPN\n# '+c['name']+'\n'
+            with store.transaction() as db:db.execute('UPDATE clients SET config=?,public_key=? WHERE id=?',(config,f'demo-rotated-{time.time_ns()}',cid))
+            return store.client(sid,cid)
         async def delete_client(self,sid,cid):
             store.client(sid,cid)
             with store.transaction() as db:db.execute('UPDATE clients SET present=0 WHERE id=? AND server_id=?',(cid,sid))
