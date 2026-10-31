@@ -21,7 +21,7 @@ from manager.web import create_web_app
 def create_demo():
     directory = tempfile.TemporaryDirectory(prefix='amnezia-miniapp-demo-')
     store = Store(Path(directory.name))
-    for index,name in enumerate(('Europe-01', 'Europe-02'),1):
+    for index,name in enumerate(('serv.host', 'Skystark_awg'),1):
         s = store.add_server(Server(0, name, host=f'192.0.2.{index}'))
         now = int(time.time())
         names = ['Admin · MacBook', 'Admin · iPhone', 'Kolida1', 'Kolida2', 'myRouter', 'office401', 'Склад', 'Дом', 'Длинное имя клиента для проверки переноса']
@@ -43,6 +43,7 @@ def create_demo():
         def close(self):pass
     class DemoService:
         runner_factory=DemoRunner
+        def runner(self,sid):return DemoRunner()
         async def worker(self,operation):return operation()
         def lock(self, sid):
             import asyncio
