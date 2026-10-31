@@ -122,3 +122,27 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ManagerError):
             await self.service.create_client(self.server.id,"new",None,None)
         self.assertEqual(len(parse_config((self.vpn / "wg0.conf").read_text()).peers),2)
+
+    async def test_attach_export_restores_download_without_remote_changes(self):
+        created = await self.service.create_client(self.server.id, 'exported', None, None)
+        with self.store.transaction() as conn:
+            conn.execute('UPDATE clients SET config=NULL WHERE id=?', (created['id'],))
+        before = [(self.vpn / name).read_bytes() for name in ('wg0.conf', 'clientsTable', 'runtime.json')]
+        await self.service.import_client_config(self.server.id, created['id'], created['config'])
+        self.assertEqual(self.store.client(self.server.id, created['id'])['config'], created['config'])
+        self.assertEqual(before, [(self.vpn / name).read_bytes() for name in ('wg0.conf', 'clientsTable', 'runtime.json')])
+
+    async def test_attach_export_rejects_wrong_client_server_address_and_hooks(self):
+        created = await self.service.create_client(self.server.id, 'exported', None, None)
+        other = await self.service.create_client(self.server.id, 'other', None, None)
+        text = created['config']
+        from helpers import keypair
+        _, wrong = keypair()
+        snapshot = await self.service.snapshot(self.server.id)
+        for bad in (other['config'], text.replace(snapshot.server_public, wrong),
+                    text.replace('10.30.0.4/32', '10.30.0.99/32'),
+                    text.replace('[Interface]', '[Interface]\nPostUp = echo unsafe'),
+                    text.replace('[Peer]', '[Peer]\nPublicKey = duplicate'), 'vpn://not-a-conf'):
+            with self.subTest(case=bad[:15]), self.assertRaises(ManagerError):
+                await self.service.import_client_config(self.server.id, created['id'], bad)
+            self.assertEqual(self.store.client(self.server.id, created['id'])['config'], text)

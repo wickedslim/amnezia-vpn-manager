@@ -33,12 +33,12 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         self.service.snapshot.return_value=SimpleNamespace(config=SimpleNamespace(peers=[]),timestamp=105)
         await self.ui.server(s.id)
         text=self.bot.edit_message_text.call_args.kwargs['text']
-        self.assertIn('↓ На устройства 2.0 КиБ',text)
+        self.assertIn('↓ На устройства 2.0 Кб',text)
         self.assertIn('↑ С устройств 200 Б',text)
         self.assertIn('Скорость: ↓ 200 Б/с  ↑ 20 Б/с',text)
         self.service.overview=AsyncMock(return_value={s.id:object()})
         await self.ui.home()
-        self.assertIn('↓ 2.0 КиБ · ↑ 200 Б',self.bot.edit_message_text.call_args.kwargs['text'])
+        self.assertIn('↓ 2.0 Кб · ↑ 200 Б',self.bot.edit_message_text.call_args.kwargs['text'])
 
     async def test_wizard_direct_password_does_not_require_extra_button(self):
         await self.ui.begin({"kind":"server","step":"name"})

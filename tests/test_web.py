@@ -84,3 +84,34 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         response=await self.client.get('/');self.assertEqual(response.status,200)
         self.assertIn('Content-Security-Policy',response.headers)
         response=await self.client.get('/assets/setting.ini');self.assertEqual(response.status,404)
+
+    async def test_attach_config_requires_auth_and_validated_service(self):
+        self.service.import_client_config = AsyncMock()
+        path = f'/api/servers/{self.server.id}/clients/1/config'
+        response = await self.client.post(path, json={'config': 'private-export'})
+        self.assertEqual(response.status, 401)
+        self.service.import_client_config.assert_not_awaited()
+        response = await self.client.post(path, headers=self.headers, json={'config': 123})
+        self.assertEqual(response.status, 400)
+        self.service.import_client_config.assert_not_awaited()
+        response = await self.client.post(path, headers=self.headers, json={'config': 'client-export'})
+        self.assertEqual(response.status, 200)
+        self.service.import_client_config.assert_awaited_once_with(self.server.id, 1, 'client-export')
+
+    async def test_preferences_authenticated_persisted_and_normalized(self):
+        response=await self.client.post('/api/preferences',json={'palette':'pink'})
+        self.assertEqual(response.status,401)
+        response=await self.client.post('/api/preferences',headers=self.headers,json={'palette':'pink','fontSize':16,'motion':False})
+        self.assertEqual(response.status,200)
+        response=await self.client.get('/api/preferences',headers=self.headers)
+        p=await response.json()
+        self.assertEqual((p['palette'],p['fontSize'],p['motion']),('pink',16,False))
+
+    async def test_reboot_api_rejects_unauthenticated_and_unconfirmed(self):
+        import asyncio
+        self.service.lock=lambda sid: asyncio.Lock()
+        base=f'/api/servers/{self.server.id}/reboot'
+        response=await self.client.post(base+'/prepare',json={})
+        self.assertEqual(response.status,401)
+        response=await self.client.post(base,headers=self.headers,json={'nonce':'invalid','name':'test'})
+        self.assertEqual(response.status,400)
