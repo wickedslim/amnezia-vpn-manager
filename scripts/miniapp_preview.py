@@ -36,15 +36,23 @@ def create_demo():
         installed=False
         def __init__(self,*args):pass
         def run(self,command,**kwargs):
+            from manager.resources import READ as RESOURCE_READ
+            if command==RESOURCE_READ:
+                import json
+                ticks=int(time.time()*100)
+                return json.dumps(dict(boot="demo",updated=int(time.time()),cpu_total=ticks*4,cpu_idle=int(ticks*3.36),memory_total=2*1024**3,memory_used=int((.48+.02*math.sin(time.time()/15))*2*1024**3),disk_total=40*1024**3,disk_used=13*1024**3))
             from manager.speedtest import PROBE,INSTALL
             if command==PROBE:return 'python' if self.installed else 'missing'
             if command==INSTALL:DemoRunner.installed=True;return ''
+            if command.startswith('speedtest-cli '):time.sleep(6)
             return '{"download":310000000,"upload":185000000,"ping":12.8,"server":{"name":"Демо-узел"}}'
         def close(self):pass
     class DemoService:
         runner_factory=DemoRunner
         def runner(self,sid):return DemoRunner()
-        async def worker(self,operation):return operation()
+        async def worker(self,operation):
+            import asyncio
+            return await asyncio.to_thread(operation)
         def lock(self, sid):
             import asyncio
             return asyncio.Lock()
@@ -67,6 +75,8 @@ def create_demo():
                     db.execute('INSERT OR REPLACE INTO samples VALUES (?,?,?,?,?)',(s.id,now,first['rx']+int(dt*(180000+60000*math.sin(now/10+s.id))),first['tx']+int(dt*(70000+30000*math.cos(now/8))),4))
                 store.set_pref(f'health:{s.id}',{'ok':True,'updated':now})
             return {}
+        async def probe(self,server):
+            if not server.host.endswith('.example'):raise ValueError('Demo accepts .example hosts only')
         async def create_client(self,sid,name,duration,limit):
             from manager.domain import validate_name,ManagerError
             validate_name(name)
