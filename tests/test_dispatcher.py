@@ -79,3 +79,29 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(TelegramConflictError):
             await ConflictGuard(event)(request,self.bot,method)
         self.assertTrue(event.is_set())
+
+
+    async def test_two_admins_have_separate_panels_revisions_and_revocation(self):
+        self.ui.access.grant(123,456,'Друг')
+        await self.dispatcher.feed_update(self.bot,Update(update_id=1,message=self.message('/start',456)))
+        self.assertEqual(self.session.calls[-1].chat_id,456)
+        self.assertEqual(self.store.get_pref('panel:456'),100)
+        self.assertIsNone(self.store.get_pref('panel'))
+        await self.dispatcher.feed_update(self.bot,Update(update_id=2,message=self.message('/start',123)))
+        self.assertEqual(self.ui.revisions,{456:1,123:1})
+        user=User(id=456,is_bot=False,first_name='Friend')
+        callback=CallbackQuery(id='blocked',from_user=user,chat_instance='test',message=self.message('menu',456),data='newserver')
+        await self.dispatcher.feed_update(self.bot,Update(update_id=3,callback_query=callback))
+        self.assertIsNone(self.store.wizard(456))
+        self.assertIn('владельцу',self.session.calls[-1].text)
+        self.ui.access.revoke(123,456)
+        count=len(self.session.calls)
+        await self.dispatcher.feed_update(self.bot,Update(update_id=4,message=self.message('/start',456)))
+        self.assertEqual(len(self.session.calls),count)
+
+
+    async def test_id_is_available_without_admin_rights_but_grants_no_access(self):
+        await self.dispatcher.feed_update(self.bot,Update(update_id=1,message=self.message('/id',999)))
+        self.assertIn('999',self.session.calls[-1].text)
+        self.assertFalse(self.ui.access.allowed(999))
+        self.assertIsNone(self.store.get_pref('panel:999'))

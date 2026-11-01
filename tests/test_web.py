@@ -120,3 +120,43 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status,401)
         response=await self.client.post(base,headers=self.headers,json={'nonce':'invalid','name':'test'})
         self.assertEqual(response.status,400)
+
+
+    async def test_admin_grant_revocation_and_owner_only_controls(self):
+        response=await self.client.post('/api/admins',headers=self.headers,json={'id':456,'name':'Друг'})
+        self.assertEqual(response.status,200)
+        admin={'Authorization':'tma '+signed(uid=456)}
+        response=await self.client.get('/api/overview',headers=admin)
+        self.assertEqual(response.status,200)
+        self.assertFalse((await response.json())['access']['owner'])
+        for path,body in [('/api/admins',{'id':789,'name':'Other'}),('/api/servers',{'name':'blocked'})]:
+            self.assertEqual((await self.client.post(path,headers=admin,json=body)).status,403)
+        self.assertEqual((await self.client.get('/api/admins',headers=admin)).status,403)
+        self.assertEqual((await self.client.delete('/api/admins/123',headers=self.headers)).status,400)
+        self.assertEqual((await self.client.delete('/api/admins/456',headers=self.headers)).status,200)
+        self.assertEqual((await self.client.get('/api/overview',headers=admin)).status,401)
+
+    async def test_admin_preferences_and_confirmations_are_isolated(self):
+        await self.client.post('/api/admins',headers=self.headers,json={'id':456,'name':'Друг'})
+        admin={'Authorization':'tma '+signed(uid=456)}
+        await self.client.post('/api/preferences',headers=admin,json={'mode':'dark'})
+        self.assertEqual((await (await self.client.get('/api/preferences',headers=self.headers)).json())['mode'],'auto')
+        self.assertEqual((await (await self.client.get('/api/preferences',headers=admin)).json())['mode'],'dark')
+        c=self.store.clients(self.server.id)[0]
+        url=f'/api/servers/{self.server.id}/clients/{c["id"]}/reissue'
+        nonce=(await (await self.client.post(url+'/prepare',headers=self.headers,json={})).json())['nonce']
+        self.assertEqual((await self.client.post(url,headers=admin,json={'nonce':nonce})).status,400)
+
+    async def test_add_server_probes_before_save_and_redacts_credentials(self):
+        self.service.probe=AsyncMock()
+        data=dict(name='Второй',connection='root@203.0.113.5:2222',password='secret-new-password')
+        response=await self.client.post('/api/servers',headers=self.headers,json=data)
+        self.assertEqual(response.status,201)
+        self.assertNotIn('secret-new-password',await response.text())
+        self.service.probe.assert_awaited_once()
+        server=self.store.server((await response.json())['id'])
+        self.assertEqual((server.port,server.password),(2222,'secret-new-password'))
+        self.service.probe.side_effect=RuntimeError('SSH failed')
+        response=await self.client.post('/api/servers',headers=self.headers,json={**data,'name':'Broken','connection':'203.0.113.6'})
+        self.assertEqual(response.status,500)
+        self.assertEqual(len(self.store.servers()),2)

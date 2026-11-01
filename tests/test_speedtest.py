@@ -49,3 +49,21 @@ class JobTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_server_and_unknown_actions(self):
         with self.assertRaises(ManagerError):self.jobs.start(999,'check')
         with self.assertRaises(ManagerError):self.jobs.start(self.server.id,'invalid')
+
+
+    async def test_run_probes_then_runs_without_separate_check(self):
+        self.jobs.start(self.server.id,'run')
+        await self.jobs.tasks[self.server.id]
+        self.assertEqual(self.calls[0][0],PROBE)
+        self.assertTrue(self.calls[1][0].startswith('speedtest-cli '))
+        self.assertEqual(self.jobs.status(self.server.id)['result']['download'],100)
+
+    async def test_missing_tool_does_not_install_or_consume_cooldown(self):
+        class Missing:
+            def __init__(self,*args):pass
+            def run(self,cmd,**kwargs):return 'missing'
+            def close(self):pass
+        self.jobs.service.runner_factory=Missing
+        self.jobs.start(self.server.id,'run');await self.jobs.tasks[self.server.id]
+        self.assertEqual(self.jobs.status(self.server.id)['tool'],'missing')
+        self.assertNotIn(self.server.id,self.jobs.started)
