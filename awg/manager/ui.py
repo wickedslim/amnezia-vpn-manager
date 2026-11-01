@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
 import base64
 import ipaddress
 import logging
@@ -19,6 +20,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
+from .access import Access
 from .domain import ManagerError, Server, validate_name
 from .service import VPNService
 from .reissue import Reissues
@@ -32,13 +34,16 @@ LIMITS = [("5 ГБ", "5000000000"), ("10 ГБ", "10000000000"), ("30 ГБ", "300
 
 
 class AccessMiddleware(BaseMiddleware):
-    def __init__(self, admin_id: int):
-        self.admin_id = admin_id
+    def __init__(self, admin_id: int, access=None, actor=None):
+        self.admin_id,self.access,self.actor = admin_id,access,actor
 
     async def __call__(self, handler, event, data):
         uid = event.from_user.id if event.from_user else None
         chat = event.message.chat if isinstance(event, CallbackQuery) and event.message else getattr(event, "chat", None)
-        if uid != self.admin_id or chat is None or chat.type != "private" or chat.id != self.admin_id:
+        if isinstance(event,Message) and (event.text or '').split(' ',1)[0].split('@',1)[0]=='/id' and uid is not None and chat and chat.type=='private' and chat.id==uid:
+            await event.answer(f'Ваш Telegram ID: <code>{uid}</code>\nПередайте его владельцу для получения доступа. Команда не предоставляет права управления.')
+            return
+        if not (self.access.allowed(uid) if self.access else uid==self.admin_id) or chat is None or chat.type != "private" or chat.id != uid:
             if isinstance(event, CallbackQuery):
                 await event.answer("Доступ только администратору в личном чате.", show_alert=True)
             return
@@ -47,7 +52,11 @@ class AccessMiddleware(BaseMiddleware):
                 await event.answer()
             except TelegramBadRequest:
                 return
-        return await handler(event, data)
+        token=self.actor.set(uid) if self.actor else None
+        try:
+            return await handler(event, data)
+        finally:
+            if self.actor:self.actor.reset(token)
 
 
 def connection(value: str) -> tuple[str, int, str]:
@@ -75,23 +84,43 @@ def connection(value: str) -> tuple[str, int, str]:
 
 class UI:
     def __init__(self, bot: Bot, store: Store, service: VPNService, admin_id: int):
-        self.bot, self.store, self.service, self.admin_id = bot, store, service, admin_id
+        self.bot, self.store, self.service, self.owner_id = bot, store, service, admin_id
+        self.actor=ContextVar("telegram_actor",default=admin_id)
+        self.access=Access(store,admin_id)
+        self.revisions={}
+        self.reissue_controllers={}
         self.router = Router()
-        self.router.message.outer_middleware(AccessMiddleware(admin_id))
-        self.router.callback_query.outer_middleware(AccessMiddleware(admin_id))
+        self.router.message.outer_middleware(AccessMiddleware(admin_id,self.access,self.actor))
+        self.router.callback_query.outer_middleware(AccessMiddleware(admin_id,self.access,self.actor))
         self.router.message.register(self.start, Command("start", "help", "servers", "cancel"))
         self.router.message.register(self.message)
         self.router.callback_query.register(self.callback, F.data)
         self.wizard_lock = asyncio.Lock()
         self.panel_lock = asyncio.Lock()
         self.revision = 0
-        self.reissues = Reissues(store, service)
+
+
+    @property
+    def admin_id(self):return self.actor.get()
+    @property
+    def revision(self):return self.revisions.get(self.admin_id,0)
+    @revision.setter
+    def revision(self,value):self.revisions[self.admin_id]=value
+    @property
+    def reissues(self):
+        if self.admin_id not in self.reissue_controllers:self.reissue_controllers[self.admin_id]=Reissues(self.store,self.service)
+        return self.reissue_controllers[self.admin_id]
+    def panel_key(self):return 'panel' if self.admin_id==self.owner_id else f'panel:{self.admin_id}'
 
     async def panel(self, text, markup, revision=None):
+        if self.admin_id!=self.owner_id:
+            restricted={'newserver','editserver','settings','unlink','unlinkyes','backup'}
+            rows=[[b for b in row if (b.callback_data or '').split(':')[0] not in restricted] for row in markup.inline_keyboard]
+            markup=markup.model_copy(update={'inline_keyboard':[row for row in rows if row]})
         async with self.panel_lock:
             if revision is not None and revision != self.revision:
                 return
-            previous = self.store.get_pref("panel")
+            previous = self.store.get_pref(self.panel_key())
             if previous:
                 try:
                     await self.bot.edit_message_text(chat_id=self.admin_id, message_id=previous, text=text, reply_markup=markup)
@@ -102,7 +131,7 @@ class UI:
                 except TelegramForbiddenError:
                     raise
             message = await self.bot.send_message(self.admin_id, text, reply_markup=markup)
-            self.store.set_pref("panel", message.message_id)
+            self.store.set_pref(self.panel_key(), message.message_id)
 
     async def start(self, message: Message):
         self.revision += 1
@@ -151,7 +180,7 @@ class UI:
 
     async def server(self, sid, revision=None, force=False):
         server = self.store.server(sid)
-        self.store.set_pref("selected_server", sid)
+        self.store.set_pref(f"selected_server:{self.admin_id}", sid)
         navigation = keyboard([("↻ Повторить", f"sr:{sid}")], [("‹ Все серверы", "home")])
         await self.panel(f"<b>{e(server.name)}</b>\n\nПолучаю статистику…", navigation, revision)
         try:
@@ -217,6 +246,7 @@ class UI:
         parts = call.data.split(":")
         action = parts[0]
         try:
+            if action in {"newserver","editserver","settings","unlink","unlinkyes","backup"}:self.access.require_owner(self.admin_id)
             if action == "w":
                 async with self.wizard_lock:
                     await self.wizard_action(parts)
@@ -344,6 +374,7 @@ class UI:
         await self.panel(f"<b>{e(c['name'])} › IP подключения</b>\n\n<code>{e(str(address))}</code>{details}\n\nПоследнее соединение: {ago(c['handshake'])}\n\n<b>Последние адреса</b>\n{recent}", keyboard([("‹ Клиент", f"c:{sid}:{cid}")]), revision)
 
     async def begin(self, wizard):
+        if wizard.get("kind")=="server":self.access.require_owner(self.admin_id)
         wizard.update(nonce=secrets.token_hex(4), history=[])
         self.store.set_wizard(self.admin_id, wizard)
         await self.show_wizard(wizard)
@@ -518,6 +549,7 @@ class UI:
                 await message.answer("Не удалось обработать ввод. /start продолжит текущий шаг.")
 
     async def save_wizard(self, w):
+        if w["kind"]=="server":self.access.require_owner(self.admin_id)
         revision = self.revision
         w["step"] = "saving"
         self.store.set_wizard(self.admin_id, w)

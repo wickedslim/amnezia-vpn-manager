@@ -97,17 +97,18 @@ async def run(settings: Settings, store: Store) -> int:
             web_runner = await start_web(settings, store, service, os.environ.get("AWG_WEB_HOST", "127.0.0.1"), int(web_port))
         web_url = "" if bot_only else os.environ.get("AWG_WEB_URL", "")
         if bot_only:
-            await bot.set_chat_menu_button(chat_id=settings.admin_id, menu_button=MenuButtonCommands())
+            await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
         if web_url:
             from urllib.parse import urlsplit
             parsed = urlsplit(web_url)
             if not web_runner or parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
                 raise ValueError("Mini App: задайте AWG_WEB_PORT и публичный HTTPS-адрес AWG_WEB_URL")
-            await bot.set_chat_menu_button(chat_id=settings.admin_id, menu_button=MenuButtonWebApp(text="Панель VPN", web_app=WebAppInfo(url=web_url)))
+            await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="Панель VPN", web_app=WebAppInfo(url=web_url)))
         await bot.set_my_commands([
             BotCommand(command="servers", description="Обзор серверов"),
             BotCommand(command="start", description="Открыть меню или продолжить ввод"),
             BotCommand(command="cancel", description="Отменить текущий ввод"),
+            BotCommand(command="id", description="Мой Telegram ID"),
         ])
         background = asyncio.create_task(monitor(service, bot, settings.admin_id, settings.poll_seconds))
         polling = asyncio.create_task(dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types(), close_bot_session=False))

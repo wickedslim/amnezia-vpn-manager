@@ -7,12 +7,16 @@ import hmac
 import json
 import logging
 import math
+import re
 import time
 from pathlib import Path
 from urllib.parse import parse_qsl
 
 from aiohttp import web
 
+from .access import Access
+from .domain import Server, validate_name
+from .ui import connection
 from .reboot import Reboots
 from .reissue import Reissues
 from .preferences import normalize_preferences
@@ -20,6 +24,7 @@ from .domain import ManagerError
 from .views import rates
 from .speedtest import Speedtests
 from .hoststats import HostStats
+from .resources import Resources
 
 log = logging.getLogger(__name__)
 STATIC = Path(__file__).resolve().parents[2] / 'miniapp'
@@ -42,7 +47,7 @@ def validate_init_data(raw: str, token: str, admin_id: int, now=None) -> int:
         if not -30 <= age <= 3600:
             raise ValueError
         uid = json.loads(values['user'])['id']
-        if type(uid) is not int or uid != admin_id:
+        if type(uid) is not int or uid not in (admin_id if isinstance(admin_id, (list,tuple,set)) else [admin_id]):
             raise ValueError
         return uid
     except (ValueError, KeyError, TypeError):
@@ -69,25 +74,78 @@ def policy(body):
 class MiniApp:
     def __init__(self, settings, store, service):
         self.settings, self.store, self.service = settings, store, service
+        self.access = Access(store, settings.admin_id)
+        self.server_add_lock = asyncio.Lock()
         self.refresh_lock = asyncio.Lock()
         self.last_refresh = 0.0
         self.speedtests = Speedtests(store, service)
         self.hoststats = HostStats(store, service)
+        self.resources = Resources(store, service)
         self.reboots = Reboots(store, service)
         self.reissues = Reissues(store, service)
+        self.actor_controllers = {}
+
+    def require_owner(self,uid):
+        if uid!=self.settings.admin_id:
+            raise web.HTTPForbidden(text=json.dumps({'error':'Это действие доступно только владельцу бота.'},ensure_ascii=False),content_type='application/json')
+
+    async def administrators(self, request):
+        actor=request['uid']
+        self.require_owner(actor)
+        if request.method=='POST':
+            body=await request.json()
+            if not isinstance(body,dict):raise ManagerError('Проверьте данные администратора.')
+            self.access.grant(actor,body.get('id'),body.get('name'))
+        elif request.method=='DELETE':
+            self.access.revoke(actor,int(request.match_info['uid']))
+        return web.json_response({'admins':self.access.admins(),'owner_id':self.settings.admin_id})
+
+    async def add_server(self, request):
+        self.require_owner(request['uid'])
+        body=await request.json()
+        if not isinstance(body,dict):raise ManagerError('Проверьте параметры сервера.')
+        name=body.get('name')
+        if not isinstance(name,str):raise ManagerError('Введите название сервера.')
+        name=validate_name(name)
+        address=body.get('connection','')
+        if not isinstance(address,str):raise ManagerError('Введите SSH-адрес сервера.')
+        host,port,username=connection(address)
+        auth=body.get('auth_type','password')
+        password=body.get('password');key=body.get('key_path')
+        if auth not in {'password','key'}:raise ManagerError('Выберите пароль или SSH-ключ.')
+        if auth=='password' and (not isinstance(password,str) or not password or len(password)>4096):raise ManagerError('Введите пароль SSH.')
+        if auth=='key' and (not isinstance(key,str) or not Path(key).is_absolute() or not Path(key).is_file()):raise ManagerError('Файл SSH-ключа не найден на машине с ботом.')
+        container=body.get('container') or 'amnezia-awg'
+        path=body.get('config_path') or '/opt/amnezia/awg/wg0.conf'
+        endpoint=body.get('endpoint') or host
+        if not isinstance(container,str) or not re.fullmatch(r'[\w.-]{1,128}',container) or not isinstance(path,str) or not re.fullmatch(r'/[\w./-]+\.conf',path):raise ManagerError('Проверьте имя контейнера и путь к конфигу.')
+        if not isinstance(endpoint,str) or len(endpoint)>253 or not re.fullmatch(r'[a-zA-Z0-9.:_-]+',endpoint):raise ManagerError('Укажите VPN-адрес без протокола и порта.')
+        server=Server(0,name,host=host,port=port,username=username,auth_type=auth,password=password if auth=='password' else None,key_path=key if auth=='key' else None,endpoint=endpoint,container=container,config_path=path)
+        async with self.server_add_lock:
+            await self.service.probe(server)
+            server=self.store.add_server(server)
+        self.last_refresh=0
+        return web.json_response({'id':server.id,'name':server.name},status=201)
+
+    def controller(self, request, kind):
+        uid=request['uid']
+        if uid==self.settings.admin_id:return self.reboots if kind=='reboot' else self.reissues
+        key=(uid,kind)
+        if key not in self.actor_controllers:self.actor_controllers[key]=(Reboots if kind=='reboot' else Reissues)(self.store,self.service)
+        return self.actor_controllers[key]
 
     async def prepare_reboot(self, request):
-        return web.json_response(self.reboots.prepare(int(request.match_info['sid'])))
+        return web.json_response(self.controller(request,'reboot').prepare(int(request.match_info['sid'])))
 
     async def reboot(self, request):
         body = await request.json()
         if not isinstance(body, dict):
             raise ManagerError('Подтвердите перезагрузку сервера.')
-        result = await self.reboots.execute(int(request.match_info['sid']), body.get('nonce'), body.get('name'))
+        result = await self.controller(request,'reboot').execute(int(request.match_info['sid']), body.get('nonce'), body.get('name'))
         return web.json_response(result)
 
     async def preferences(self, request):
-        key = f'ui_preferences:{self.settings.admin_id}'
+        key = f"ui_preferences:{request['uid']}"
         if request.method == 'POST':
             body = await request.json()
             if not isinstance(body, dict):
@@ -101,7 +159,7 @@ class MiniApp:
             if time.monotonic()-self.last_refresh >= 5:
                 await self.service.overview(force=True)
                 self.last_refresh = time.monotonic()
-        await self.hoststats.refresh()
+        await asyncio.gather(self.hoststats.refresh(), self.resources.refresh())
         servers = []
         for s in self.store.servers():
             health = self.store.get_pref(f'health:{s.id}', {})
@@ -115,8 +173,8 @@ class MiniApp:
                     c['online'] = False
             servers.append(dict(id=s.id, name=s.name, ok=reachable, updated=latest['ts'], rx=latest['tx'], tx=latest['rx'],
                                 rate_rx=tx if reachable else 0, rate_tx=rx if reachable else 0,
-                                online=sum(c['online'] for c in clients), host_traffic=self.hoststats.get(s.id), clients=clients, samples=[{**p, "rx":p["tx"], "tx":p["rx"]} for p in samples]))
-        return web.json_response(dict(servers=servers, monthly_since=self.store.get_pref('monthly_since'), demo=False))
+                                online=sum(c['online'] for c in clients), host_traffic=self.hoststats.get(s.id), resources=self.resources.get(s.id), clients=clients, samples=[{**p, "rx":p["tx"], "tx":p["rx"]} for p in samples]))
+        return web.json_response(dict(servers=servers, monthly_since=self.store.get_pref('monthly_since'), access={'owner':request['uid']==self.settings.admin_id}, demo=False))
 
     async def speedtest(self, request):
         sid = int(request.match_info['sid'])
@@ -158,13 +216,13 @@ class MiniApp:
         return web.json_response({'ok': True})
 
     async def prepare_reissue(self, request):
-        return web.json_response(self.reissues.prepare(int(request.match_info['sid']), int(request.match_info['cid'])))
+        return web.json_response(self.controller(request,'reissue').prepare(int(request.match_info['sid']), int(request.match_info['cid'])))
 
     async def reissue(self, request):
         body = await request.json()
         if not isinstance(body, dict):
             raise ManagerError('Подтвердите перевыпуск конфига.')
-        c = await self.reissues.execute(int(request.match_info['sid']), int(request.match_info['cid']), body.get('nonce'))
+        c = await self.controller(request,'reissue').execute(int(request.match_info['sid']), int(request.match_info['cid']), body.get('nonce'))
         self.last_refresh = 0
         return web.json_response({'config': c['config'], 'name': c['name']})
 
@@ -183,7 +241,7 @@ def create_web_app(settings, store, service):
         try:
             if request.path.startswith('/api/'):
                 auth = request.headers.get('Authorization', '')
-                validate_init_data(auth[4:] if auth.startswith('tma ') else '', settings.token, settings.admin_id)
+                request['uid'] = validate_init_data(auth[4:] if auth.startswith('tma ') else '', settings.token, [settings.admin_id]+[a['id'] for a in api.access.admins()])
             response = await handler(request)
         except ManagerError as exc:
             response = web.json_response({'error': str(exc)}, status=400)
@@ -213,6 +271,10 @@ def create_web_app(settings, store, service):
     app.router.add_get('/', index)
     app.router.add_get('/assets/{name}', asset)
     app.router.add_get('/api/overview', api.overview)
+    app.router.add_get('/api/admins', api.administrators)
+    app.router.add_post('/api/admins', api.administrators)
+    app.router.add_delete(r'/api/admins/{uid:\d+}', api.administrators)
+    app.router.add_post('/api/servers', api.add_server)
     app.router.add_get(r'/api/servers/{sid:\d+}/speedtest', api.speedtest)
     app.router.add_post(r'/api/servers/{sid:\d+}/speedtest', api.speedtest)
     host_task = None

@@ -53,12 +53,9 @@ class Speedtests:
             return self.status(sid)
         previous = self.statuses.get(sid, {})
         if action == 'run':
-            if previous.get('tool') not in {'python','ookla'}:
-                raise ManagerError('Сначала проверьте наличие Speedtest.')
             if time.monotonic()-self.started.get(sid, -1000) < 60:
                 raise ManagerError('Между проверками скорости нужна пауза в одну минуту.')
-            self.started[sid] = time.monotonic()
-        self.statuses[sid] = {**previous, 'phase':{'check':'checking','install':'installing','run':'running'}[action], 'error':None}
+        self.statuses[sid] = {**previous, 'phase':{'check':'checking','install':'installing','run':'checking'}[action], 'error':None}
         self.tasks[sid] = asyncio.create_task(self._job(sid, action))
         return self.status(sid)
 
@@ -73,18 +70,23 @@ class Speedtests:
                     return 'python', None
                 if action == 'check':
                     return runner.run(PROBE).strip(), None
-                if tool == 'ookla':
+                detected=runner.run(PROBE).strip()
+                if detected not in {'python','ookla'}:return detected,None
+                self.statuses[sid]={'phase':'running','tool':detected,'error':None}
+                self.started[sid]=time.monotonic()
+                if detected == 'ookla':
                     # Never auto-accept Ookla's licence/GDPR terms.
                     raw = runner.run('speedtest --format=json --progress=no </dev/null', timeout=90)
                 else:
                     raw = runner.run('speedtest-cli --secure --json --timeout 15 </dev/null', timeout=90)
-                return tool, parse_result(raw, tool)
+                return detected, parse_result(raw, detected)
             finally:
                 runner.close()
         try:
             tool, result = await self.service.worker(operation)
             if tool not in {'python','ookla','missing','unknown'}:
                 raise ManagerError('Не удалось определить установленный Speedtest.')
+            if tool=='unknown':raise ManagerError('Неизвестная утилита Speedtest.')
             if result:
                 self.store.set_pref(f'speedtest:{sid}', result)
             self.statuses[sid] = {'phase':'ready','tool':tool,'error':None}
