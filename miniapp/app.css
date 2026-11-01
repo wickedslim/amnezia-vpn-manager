@@ -77,3 +77,16 @@ dialog .toolbar>button{display:flex;align-items:center;justify-content:center;mi
 dialog{max-height:calc(100dvh - 32px);overflow-y:auto;overscroll-behavior:contain}
 
 .page-heading h1{overflow-wrap:anywhere}
+
+/* Status is semantic, independent of the chosen accent palette. */
+.client-status:not(.off):not(.error){width:9px;height:9px;background:#20e77a;box-shadow:0 0 0 3px #20e77a18}
+.live-pill i{position:relative;background:#20e77a;box-shadow:0 0 0 3px #20e77a18}
+:root[data-motion=on] .live-pill:not(.disconnected) i::after{content:'';position:absolute;inset:-3px;border:1px solid #20e77a;border-radius:50%;animation:live-pulse 2.2s ease-out infinite;pointer-events:none}
+.live-pill.disconnected i{background:var(--tg-theme-hint-color);box-shadow:none}
+@keyframes live-pulse{0%{transform:scale(.7);opacity:.6}85%,100%{transform:scale(1.8);opacity:0}}
+
+/* Selected settings retain legible text on the tinted accent surface. */
+:root[data-theme=dark] .palette-grid [aria-pressed=true],:root[data-theme=dark] .preference-segment [aria-pressed=true]{color:#fff}
+.search .field{height:44px;min-height:44px;padding:9px 12px 9px 38px;font-size:calc(13px * var(--text-scale,1));line-height:24px}
+.search svg{width:18px;height:18px;left:12px;top:13px}
+#client-server{min-height:44px;padding:9px 12px;font-size:calc(13px * var(--text-scale,1))}
