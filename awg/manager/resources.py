@@ -24,12 +24,12 @@ def measure(current, previous=None):
             raise ValueError('Invalid capacity')
     if current['cpu_idle']>current['cpu_total']:raise ValueError('Invalid CPU counters')
     cpu=None
-    if previous and previous['boot']==current['boot']:
+    if previous and previous['boot']==current['boot'] and 0 < current['updated']-previous['updated'] <= 20:
         total=current['cpu_total']-previous['cpu_total']
         idle=current['cpu_idle']-previous['cpu_idle']
         if total>0 and 0<=idle<=total:
             cpu=round(100*(total-idle)/total,1)
-    return dict(updated=current['updated'],cpu=cpu,
+    return dict(updated=current['updated'],cpu=cpu,interval=current['updated']-previous['updated'] if cpu is not None else None,
                 memory={k:current['memory_'+k] for k in ('used','total')},
                 disk={k:current['disk_'+k] for k in ('used','total')})
 

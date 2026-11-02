@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .monitoring import notify_health
 
 import argparse
 import asyncio
@@ -64,13 +65,8 @@ class ConflictGuard(BaseRequestMiddleware):
 async def monitor(service: VPNService, bot: Bot, admin: int, interval: int):
     while True:
         try:
-            before = {s.id: service.store.get_pref(f"health:{s.id}") for s in service.store.servers()}
             notifications = await service.monitor_once()
-            for server in service.store.servers():
-                previous = before.get(server.id)
-                current = service.store.get_pref(f"health:{server.id}")
-                if previous and current and previous["ok"] != current["ok"]:
-                    await bot.send_message(admin, f"{'🟢 Связь восстановлена' if current['ok'] else '🔴 Нет связи'}: <b>{e(server.name)}</b>")
+            await notify_health(service.store, bot, admin)
             for sid, text in notifications:
                 await bot.send_message(admin, f"{e(service.store.server(sid).name)}\n{e(text)}")
         except asyncio.CancelledError:

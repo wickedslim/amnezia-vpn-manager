@@ -18,8 +18,12 @@ class Access:
         if any(a['id']==uid for a in rows):raise ManagerError('Этот администратор уже добавлен.')
         if len(rows)>=20:raise ManagerError('Достигнут лимит: 20 администраторов.')
         self.store.set_pref('telegram_admins',rows+[{'id':uid,'name':name.strip()}])
+        from .audit import record
+        record(self.store,f'admin.grant:{uid}','ok')
     def revoke(self,actor,uid):
         self.require_owner(actor)
         if uid==self.owner:raise ManagerError('Нельзя удалить владельца бота.')
         self.store.set_pref('telegram_admins',[a for a in self.admins() if a['id']!=uid])
         self.store.clear_wizard(uid)
+        from .audit import record
+        record(self.store,f'admin.revoke:{uid}','ok')

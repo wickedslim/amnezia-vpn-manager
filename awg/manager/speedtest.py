@@ -5,6 +5,7 @@ import math
 import time
 
 from .domain import ManagerError
+from . import audit
 
 PROBE = '''if command -v speedtest-cli >/dev/null 2>&1; then printf 'python';
 elif command -v speedtest >/dev/null 2>&1; then
@@ -60,6 +61,8 @@ class Speedtests:
         return self.status(sid)
 
     async def _job(self, sid, action):
+        audit.record(self.store,'speedtest.'+action,'started',sid)
+        error_type=None
         tool = self.statuses[sid].get('tool')
         def operation():
             # Separate SSH channel/session: a long test does not block VPN sampling.
@@ -91,14 +94,20 @@ class Speedtests:
                 self.store.set_pref(f'speedtest:{sid}', result)
             self.statuses[sid] = {'phase':'ready','tool':tool,'error':None}
         except asyncio.CancelledError:
+            error_type='CancelledError'
             raise
-        except Exception:
+        except Exception as exc:
+            error_type=type(exc).__name__
             text = 'Не удалось выполнить Speedtest. Проверьте доступ сервера к тестовым узлам и повторите.'
             if action == 'install':
                 text = 'Установка не выполнена. Нужны Ubuntu/Debian, root по SSH и доступ к пакетным репозиториям.'
             elif tool == 'ookla':
                 text = 'Ookla не завершил тест. Возможно, на сервере ещё не приняты условия Ookla; автоматически они не принимаются.'
             self.statuses[sid] = {'phase':'error','tool':tool,'error':text}
+
+        finally:
+            phase=self.statuses.get(sid,{}).get('phase')
+            audit.record(self.store,'speedtest.'+action,'ok' if phase=='ready' else 'failed' if phase=='error' else 'unknown',sid,error=error_type)
 
     async def close(self):
         for task in self.tasks.values():

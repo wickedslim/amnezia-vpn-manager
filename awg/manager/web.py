@@ -14,6 +14,8 @@ from urllib.parse import parse_qsl
 
 from aiohttp import web
 
+from . import audit
+from .build import build_info
 from .access import Access
 from .domain import Server, validate_name
 from .ui import connection
@@ -78,6 +80,7 @@ class MiniApp:
         self.server_add_lock = asyncio.Lock()
         self.refresh_lock = asyncio.Lock()
         self.last_refresh = 0.0
+        self.poll_tasks = {}
         self.speedtests = Speedtests(store, service)
         self.hoststats = HostStats(store, service)
         self.resources = Resources(store, service)
@@ -88,6 +91,13 @@ class MiniApp:
     def require_owner(self,uid):
         if uid!=self.settings.admin_id:
             raise web.HTTPForbidden(text=json.dumps({'error':'Это действие доступно только владельцу бота.'},ensure_ascii=False),content_type='application/json')
+
+    async def audit_log(self,request):
+        self.require_owner(request['uid'])
+        before=int(request.query.get('before','0'))
+        if before<0:raise ManagerError('Некорректная страница журнала.')
+        rows=self.store.audit_events(before=before)
+        return web.json_response({'events':rows,'next':rows[-1]['id'] if len(rows)==50 else None})
 
     async def administrators(self, request):
         actor=request['uid']
@@ -153,13 +163,29 @@ class MiniApp:
             self.store.set_pref(key, normalize_preferences(body))
         return web.json_response(normalize_preferences(self.store.get_pref(key, {})))
 
+    def queue_refresh(self):
+        # A slow host cannot hold up reads or the next poll of another host.
+        if time.monotonic()-self.last_refresh < 5:
+            return
+        self.last_refresh = time.monotonic()
+        def queue(key, operation):
+            task = self.poll_tasks.get(key)
+            if task is None or task.done():
+                async def run():
+                    try:
+                        await operation()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        log.warning('Background poll failed: key=%s type=%s', key, type(exc).__name__)
+                self.poll_tasks[key] = asyncio.create_task(run())
+        for server in self.store.servers():
+            queue(('vpn', server.id), lambda sid=server.id: self.service.snapshot(sid, force=True))
+        queue('resources', self.resources.refresh)
+        queue('hoststats', self.hoststats.refresh)
+
     async def overview(self, request):
-        # Shared across tabs/users; forced reads at most once every five seconds.
-        async with self.refresh_lock:
-            if time.monotonic()-self.last_refresh >= 5:
-                await self.service.overview(force=True)
-                self.last_refresh = time.monotonic()
-        await asyncio.gather(self.hoststats.refresh(), self.resources.refresh())
+        self.queue_refresh()
         servers = []
         for s in self.store.servers():
             health = self.store.get_pref(f'health:{s.id}', {})
@@ -167,14 +193,16 @@ class MiniApp:
             rx, tx = rates(samples)
             latest = samples[-1] if samples else {'rx': 0, 'tx': 0, 'ts': 0}
             clients = [client_json(c) for c in self.store.clients(s.id)]
+            stale = time.time()-health.get('updated', 0) > 20
             reachable = bool(health.get('ok'))
-            if not reachable:
-                for c in clients:
-                    c['online'] = False
-            servers.append(dict(id=s.id, name=s.name, ok=reachable, updated=latest['ts'], rx=latest['tx'], tx=latest['rx'],
-                                rate_rx=tx if reachable else 0, rate_tx=rx if reachable else 0,
+            unknown = not reachable or stale
+            for c in clients:
+                c['status_known'] = not unknown
+                if unknown: c['online'] = False
+            servers.append(dict(id=s.id, name=s.name, ok=reachable, stale=stale, updated=latest['ts'], rx=latest['tx'], tx=latest['rx'],
+                                rate_rx=tx if not unknown else 0, rate_tx=rx if not unknown else 0,
                                 online=sum(c['online'] for c in clients), host_traffic=self.hoststats.get(s.id), resources=self.resources.get(s.id), clients=clients, samples=[{**p, "rx":p["tx"], "tx":p["rx"]} for p in samples]))
-        return web.json_response(dict(servers=servers, monthly_since=self.store.get_pref('monthly_since'), access={'owner':request['uid']==self.settings.admin_id}, demo=False))
+        return web.json_response(dict(servers=servers, monthly_since=self.store.get_pref('monthly_since'), build=build_info(), access={'owner':request['uid']==self.settings.admin_id}, demo=False))
 
     async def speedtest(self, request):
         sid = int(request.match_info['sid'])
@@ -238,10 +266,15 @@ def create_web_app(settings, store, service):
 
     @web.middleware
     async def guard(request, handler):
+        token=None; started=time.monotonic(); error=None
+        request_id=hashlib.sha256(str(time.monotonic_ns()).encode()).hexdigest()[:16]
+        operation=request.method+' '+(request.match_info.route.resource.canonical if request.match_info.route.resource else 'unmatched')
         try:
             if request.path.startswith('/api/'):
                 auth = request.headers.get('Authorization', '')
                 request['uid'] = validate_init_data(auth[4:] if auth.startswith('tma ') else '', settings.token, [settings.admin_id]+[a['id'] for a in api.access.admins()])
+                token=audit.begin(request['uid'],'web')
+                request_id=audit.context.get()['request_id']
             response = await handler(request)
         except ManagerError as exc:
             response = web.json_response({'error': str(exc)}, status=400)
@@ -249,9 +282,16 @@ def create_web_app(settings, store, service):
             response = web.json_response({'error': 'Проверьте введённые данные.'}, status=400)
         except web.HTTPException as exc:
             response = exc
-        except Exception:
-            log.error('Ошибка Mini App API', exc_info=False)
+        except Exception as exc:
+            error=type(exc).__name__
+            log.error('Mini App failure: request=%s operation=%s server=%s type=%s',request_id,operation,request.match_info.get('sid'),error)
             response = web.json_response({'error': 'Не удалось выполнить запрос. Обновите данные и повторите.'}, status=500)
+        try:
+            if token is not None and (request.method in {'POST','PATCH','DELETE'} or operation.endswith('/config')) and not operation.endswith('/preferences'):
+                audit.record(store,operation,'accepted' if response.status==202 else 'ok' if response.status<400 else 'failed',int(request.match_info['sid']) if 'sid' in request.match_info else None,int(request.match_info['cid']) if 'cid' in request.match_info else None,error or ('HTTP'+str(response.status) if response.status>=400 else None),int((time.monotonic()-started)*1000))
+        finally:
+            if token is not None:audit.context.reset(token)
+        response.headers['X-Request-ID']=request_id
         response.headers.update({'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
             'Content-Security-Policy': "default-src 'self'; script-src 'self' https://telegram.org; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'"})
         return response
@@ -261,7 +301,7 @@ def create_web_app(settings, store, service):
         return web.FileResponse(STATIC / 'index.html')
     async def asset(request):
         name = request.match_info['name']
-        if name not in {'app.js', 'app.css', 'preferences.js'}:
+        if name not in {'app.js', 'app.css', 'preferences.js', 'dom.js'}:
             raise web.HTTPNotFound()
         return web.FileResponse(STATIC / name)
     app.router.add_post(r'/api/servers/{sid:\d+}/reboot/prepare', api.prepare_reboot)
@@ -271,6 +311,7 @@ def create_web_app(settings, store, service):
     app.router.add_get('/', index)
     app.router.add_get('/assets/{name}', asset)
     app.router.add_get('/api/overview', api.overview)
+    app.router.add_get('/api/audit',api.audit_log)
     app.router.add_get('/api/admins', api.administrators)
     app.router.add_post('/api/admins', api.administrators)
     app.router.add_delete(r'/api/admins/{uid:\d+}', api.administrators)
@@ -280,8 +321,8 @@ def create_web_app(settings, store, service):
     host_task = None
     async def host_monitor():
         while True:
-            await api.hoststats.refresh()
-            await asyncio.sleep(60)
+            api.queue_refresh()
+            await asyncio.sleep(5)
     async def startup(app):
         nonlocal host_task
         host_task = asyncio.create_task(host_monitor())
@@ -289,6 +330,8 @@ def create_web_app(settings, store, service):
         if host_task:
             host_task.cancel()
             await asyncio.gather(host_task, return_exceptions=True)
+        for task in api.poll_tasks.values(): task.cancel()
+        await asyncio.gather(*api.poll_tasks.values(), return_exceptions=True)
         await api.speedtests.close()
     app.on_startup.append(startup)
     app.on_cleanup.append(cleanup)

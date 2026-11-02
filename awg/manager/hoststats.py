@@ -54,4 +54,4 @@ class HostStats:
     def get(self,sid):
         value=self.store.get_pref(f'hosttraffic:{sid}')
         if not value:return None
-        return {k:value[k] for k in ('rx','tx','since','updated','interface')}
+        return {**{k:value[k] for k in ('rx','tx','since','updated','interface')}, 'stale':time.time()-value['updated']>120}

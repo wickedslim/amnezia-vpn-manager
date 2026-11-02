@@ -25,6 +25,7 @@ from .domain import ManagerError, Server, validate_name
 from .service import VPNService
 from .reissue import Reissues
 from .store import Store
+from . import audit
 from .views import ago, client_text, e, keyboard, rates, size, sparkline
 
 log = logging.getLogger(__name__)
@@ -52,10 +53,12 @@ class AccessMiddleware(BaseMiddleware):
                 await event.answer()
             except TelegramBadRequest:
                 return
+        audit_token=audit.begin(uid,'bot')
         token=self.actor.set(uid) if self.actor else None
         try:
             return await handler(event, data)
         finally:
+            audit.context.reset(audit_token)
             if self.actor:self.actor.reset(token)
 
 
@@ -93,12 +96,20 @@ class UI:
         self.router.message.outer_middleware(AccessMiddleware(admin_id,self.access,self.actor))
         self.router.callback_query.outer_middleware(AccessMiddleware(admin_id,self.access,self.actor))
         self.router.message.register(self.start, Command("start", "help", "servers", "cancel"))
+        self.router.message.register(self.audit_log, Command("audit"))
         self.router.message.register(self.message)
         self.router.callback_query.register(self.callback, F.data)
         self.wizard_lock = asyncio.Lock()
         self.panel_lock = asyncio.Lock()
         self.revision = 0
 
+
+    async def audit_log(self,message):
+        if self.admin_id!=self.owner_id:
+            await message.answer('Журнал доступен только владельцу.');return
+        rows=self.store.audit_events(limit=15)
+        text='\n'.join(f"#{r['id']} · {r['actor'] if r['actor'] is not None else 'система'} · {r['source']} · {r['action']} · {r['result']} · сервер {r['sid'] or '—'}" for r in rows)
+        await message.answer('<b>Последние действия</b>\n'+e(text or 'Записей пока нет.'))
 
     @property
     def admin_id(self):return self.actor.get()
@@ -322,6 +333,7 @@ class UI:
                     raise ManagerError("Сохранённого конфига пока нет. Нажмите «Перевыпустить конфиг»: новый файл сохранится для повторной выдачи, старый перестанет работать.")
                 filename = re.sub(r"[^\w.-]", "_", client["name"])[:40] or str(cid)
                 await self.bot.send_document(self.admin_id, BufferedInputFile(text.encode(), filename=f"{filename}.conf"), caption=f"{e(self.store.server(sid).name)} · {e(client['name'])}")
+                audit.record(self.store,'config.download','ok',sid,cid)
                 raw = text.encode()
                 vpn = "vpn://" + base64.urlsafe_b64encode(struct.pack(">I", len(raw)) + zlib.compress(raw, 8)).decode().rstrip("=")
                 if len(vpn) < 3800:
@@ -342,7 +354,7 @@ class UI:
             await self.error(str(exc), revision)
         except Exception as exc:
             # Do not log event bodies: the message can contain SSH credentials.
-            log.error("Ошибка интерфейса: action=%s type=%s", action, type(exc).__name__)
+            log.error("Ошибка интерфейса: request=%s action=%s type=%s", (audit.context.get() or {}).get("request_id","—"), action, type(exc).__name__)
             await self.error("Действие не завершилось. Обновите экран; подробности доступны в журнале службы.", revision)
 
     async def error(self, text, revision=None):

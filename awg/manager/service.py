@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .domain import ManagerError, Server, WGConfig, allocate_address, client_config, parse_config, parse_dump, validate_key, validate_name
+from .audit import audited
 from .store import Store
 from .transport import Runner, WG_SELECT, read_snapshot, write_peer
 
@@ -118,6 +119,7 @@ class VPNService:
                 return server.id, exc
         return dict(await asyncio.gather(*(one(s) for s in self.store.servers())))
 
+    @audited('client.create')
     async def create_client(self, sid: int, name: str, duration: int | None, limit: int | None) -> dict:
         name = validate_name(name)
         async with self.lock(sid):
@@ -158,6 +160,7 @@ printf '%s\\n' "$private" | "$WG" pubkey
                 return self.store.client(sid, cid)
             return await self.worker(operation)
 
+    @audited('client.delete')
     async def delete_client(self, sid: int, cid: int):
         async with self.lock(sid):
             def operation():
@@ -177,6 +180,7 @@ printf '%s\\n' "$private" | "$WG" pubkey
                 self._read(sid)
             await self.worker(operation)
 
+    @audited('server.disconnect')
     async def disconnect_server(self, sid: int):
         async with self.lock(sid):
             runner = self.runners.pop(sid, None)
@@ -185,6 +189,7 @@ printf '%s\\n' "$private" | "$WG" pubkey
             self.store.remove_server(sid)
             self.cache.pop(sid, None)
 
+    @audited('client.reissue')
     async def reissue_client(self, sid: int, cid: int, expected_key: str) -> dict:
         async with self.lock(sid):
             def operation():
@@ -232,6 +237,7 @@ printf '%s\\n' "$private" | "$WG" pubkey
                 return self.store.client(sid, cid)
             return await self.worker(operation)
 
+    @audited('server.update')
     async def update_server(self, server: Server):
         async with self.lock(server.id):
             await self.probe(server)
@@ -259,6 +265,7 @@ printf '%s\\n' "$private" | "$WG" pubkey
                         log.warning("Не удалось применить ограничение: server=%d client=%d", sid, client["id"])
         return notifications
 
+    @audited('backup.create')
     async def backup(self, sid: int) -> bytes:
         async with self.lock(sid):
             def operation():

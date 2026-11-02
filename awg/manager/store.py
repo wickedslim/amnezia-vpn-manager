@@ -26,6 +26,11 @@ class Store:
         self.connection.row_factory = sqlite3.Row
         os.chmod(directory / "manager.sqlite3", 0o600)
         self.connection.executescript("""
+            CREATE TABLE IF NOT EXISTS audit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, actor INTEGER,
+                source TEXT NOT NULL, request_id TEXT NOT NULL, action TEXT NOT NULL,
+                result TEXT NOT NULL, sid INTEGER, cid INTEGER, error TEXT, elapsed INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS audit_ts ON audit_events(ts);
             PRAGMA journal_mode=WAL;
             PRAGMA foreign_keys=ON;
             CREATE TABLE IF NOT EXISTS servers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL COLLATE NOCASE UNIQUE, config TEXT NOT NULL);
@@ -68,6 +73,17 @@ class Store:
             finally:
                 self.depth -= 1
 
+    def audit_record(self,actor,source,request_id,action,result,sid=None,cid=None,error=None,elapsed=0):
+        with self.transaction() as conn:
+            conn.execute("INSERT INTO audit_events(ts,actor,source,request_id,action,result,sid,cid,error,elapsed) VALUES (?,?,?,?,?,?,?,?,?,?)",(int(time.time()),actor,source,request_id,action,result,sid,cid,error,elapsed))
+            conn.execute("DELETE FROM audit_events WHERE ts<?",(int(time.time())-90*86400,))
+            conn.execute("DELETE FROM audit_events WHERE id IN (SELECT id FROM audit_events ORDER BY id DESC LIMIT -1 OFFSET 10000)")
+
+    def audit_events(self,before=0,limit=50):
+        with self.lock:
+            rows=self.connection.execute("SELECT * FROM audit_events WHERE (?=0 OR id<?) ORDER BY id DESC LIMIT ?",(before,before,limit)).fetchall()
+        return [dict(row) for row in rows]
+
     def close(self):
         self.connection.close()
 
@@ -104,6 +120,8 @@ class Store:
                 sid = cursor.lastrowid
         except sqlite3.IntegrityError as exc:
             raise ManagerError("Сервер с таким названием уже есть. Выберите другое название.") from exc
+        from .audit import record
+        record(self,'server.add','ok',sid)
         return self.server(sid)
 
     def remove_server(self, sid: int):
@@ -159,6 +177,9 @@ class Store:
         self.client(sid, cid)
         with self.transaction() as conn:
             conn.execute("UPDATE clients SET expires=?,traffic_limit=? WHERE server_id=? AND id=?", (expires, limit, sid, cid))
+
+        from .audit import record
+        record(self,"client.policy","ok",sid,cid)
 
     def prepare_rotation(self, sid: int, cid: int, old_key: str, new_key: str, config: str):
         client = self.client(sid, cid)
