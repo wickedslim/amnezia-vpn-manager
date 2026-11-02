@@ -56,6 +56,8 @@ def create_demo():
         def lock(self, sid):
             import asyncio
             return asyncio.Lock()
+        async def snapshot(self, sid, force=False):
+            await self.overview(force)
         async def overview(self, force=False):
             now=int(time.time())
             for s in store.servers():
@@ -114,6 +116,12 @@ def create_demo():
             data=json.loads(response.text);data['demo']=True
             response.text=json.dumps(data)
         return response
+    async def qa_page(request):
+        return web.FileResponse(Path(__file__).resolve().parents[1]/'tests/browser/dom.html')
+    app.router.add_get('/_qa/dom',qa_page)
+    async def qa_script(request):
+        return web.FileResponse(Path(__file__).resolve().parents[1]/'tests/browser/dom.test.js')
+    app.router.add_get('/_qa/dom.js',qa_script)
     app.middlewares.insert(0,demo)
     async def cleanup(app):
         store.close();directory.cleanup()
