@@ -90,3 +90,17 @@ dialog{max-height:calc(100dvh - 32px);overflow-y:auto;overscroll-behavior:contai
 .search .field{height:44px;min-height:44px;padding:9px 12px 9px 38px;font-size:calc(13px * var(--text-scale,1));line-height:24px}
 .search svg{width:18px;height:18px;left:12px;top:13px}
 #client-server{min-height:44px;padding:9px 12px;font-size:calc(13px * var(--text-scale,1))}
+
+/* Stable plotting area and touch targets, including compact density. */
+.chart-placeholder{height:150px;margin-top:18px;display:grid;place-items:center;text-align:center;color:var(--tg-theme-hint-color);font-size:calc(12px * var(--text-scale,1))}
+.chip,.metric-mode button,.compact{min-height:44px;min-width:44px}
+.back-link{min-height:44px;width:fit-content;padding:8px 0;margin-bottom:8px}
+.month-controls .field{min-width:0}
+:root[data-density=compact] .chip,:root[data-density=compact] .compact{min-height:44px}
+.stats-summary{min-height:0}
+
+.primary,.chip[aria-pressed=true]{background:var(--action-bg,var(--brand-color))}.motion-row{min-height:44px}
+
+@media(max-width:359px){.live-pill{display:flex;font-size:0;gap:0}.live-pill i{width:8px;height:8px}}
+
+.monthly-directions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-top:24px;padding-top:16px;border-top:1px solid color-mix(in srgb,var(--tg-theme-hint-color) 18%,transparent)}.monthly-directions dl{margin:0;min-width:0}.monthly-directions dt{font-size:calc(11px * var(--text-scale,1));color:var(--tg-theme-hint-color)}.monthly-directions dd{margin:6px 0 0;font-size:calc(18px * var(--text-scale,1));font-weight:800;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}.stats-loading{opacity:.65}:root[data-density=compact] .monthly-directions{margin-top:16px;padding-top:12px}
