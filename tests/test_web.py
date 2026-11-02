@@ -35,8 +35,8 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp=TemporaryDirectory();self.store=Store(Path(self.tmp.name));self.server=self.store.add_server(Server(0,'test',host='private-host',password='secret-password'))
         self.store.sync(self.server.id,[Peer('public','client','10.0.0.2/32','',received=100,sent=200)],'server')
-        self.store.set_pref(f'health:{self.server.id}',{'ok':True})
-        self.service=SimpleNamespace(overview=AsyncMock(),create_client=AsyncMock(),delete_client=AsyncMock())
+        self.store.set_pref(f'health:{self.server.id}',{'ok':True,'updated':time.time()})
+        self.service=SimpleNamespace(overview=AsyncMock(),snapshot=AsyncMock(),create_client=AsyncMock(),delete_client=AsyncMock())
         self.client=TestClient(TestServer(create_web_app(SimpleNamespace(token='test-token',admin_id=123),self.store,self.service)))
         await self.client.start_server();self.headers={'Authorization':'tma '+signed()}
     async def asyncTearDown(self):
@@ -50,7 +50,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
             text=await response.text();data=json.loads(text)
             self.assertNotIn('secret-password',text);self.assertNotIn('private-host',text);self.assertNotIn('public_key',text);self.assertNotIn('config',data['servers'][0]['clients'][0])
             self.assertEqual(data['servers'][0]['clients'][0]['rx'],200)
-        self.service.overview.assert_awaited_once()
+        self.service.snapshot.assert_awaited_once()
     async def test_server_directions_match_client_download(self):
         with self.store.transaction() as c:
             c.execute('DELETE FROM samples')
@@ -61,6 +61,13 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((s['rx'],s['tx']),(300,20))
         self.assertEqual((s['rate_rx'],s['rate_tx']),(40,2))
         self.assertEqual(s['samples'][-1]['rx'],300)
+    async def test_old_health_marks_client_unknown_and_hides_live_rates(self):
+        self.store.set_pref(f'health:{self.server.id}',{'ok':True,'updated':time.time()-60})
+        response=await self.client.get('/api/overview',headers=self.headers)
+        server=(await response.json())['servers'][0]
+        self.assertTrue(server['stale'])
+        self.assertFalse(server['clients'][0]['status_known'])
+        self.assertEqual((server['rate_rx'],server['rate_tx']),(0,0))
     async def test_speedtest_requires_auth(self):
         path=f'/api/servers/{self.server.id}/speedtest'
         self.assertEqual((await self.client.post(path,json={'action':'install'})).status,401)

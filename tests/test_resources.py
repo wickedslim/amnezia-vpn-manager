@@ -7,7 +7,7 @@ from manager.resources import Resources, measure
 
 
 def row(total=1000,idle=700,boot='a'):
-    return dict(boot=boot,updated=100,cpu_total=total,cpu_idle=idle,
+    return dict(boot=boot,updated=100+(total-1000)//100,cpu_total=total,cpu_idle=idle,
                 memory_total=1000,memory_used=400,disk_total=10000,disk_used=2000)
 
 
@@ -53,5 +53,5 @@ class ResourceRefreshTests(unittest.IsolatedAsyncioTestCase):
             await resources.refresh()
             self.assertEqual(resources.get(1)['cpu'],50)
             self.assertFalse(resources.get(1)['stale'])
-        with patch('manager.resources.time.time',return_value=121):self.assertTrue(resources.get(1)['stale'])
+        with patch('manager.resources.time.time',return_value=130):self.assertTrue(resources.get(1)['stale'])
         self.assertIsNone(resources.get(2))
