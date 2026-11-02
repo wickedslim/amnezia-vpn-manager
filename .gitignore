@@ -14,3 +14,7 @@ dist/
 preview/
 .DS_Store
 .venvs/
+
+node_modules/
+test-results/
+playwright-report/
