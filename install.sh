@@ -64,6 +64,9 @@ fi
 for name in awg/manager awg/bot_manager.py miniapp requirements.txt LICENSE VERSION; do
     [[ -e "$SOURCE/$name" ]] || { echo "Неполный релиз: нет $name" >&2; exit 1; }
 done
+if [[ -f "$SOURCE/SHA256SUMS" ]]; then
+    (cd "$SOURCE" && sha256sum -c SHA256SUMS >/dev/null) || { echo 'Контрольные суммы релиза не совпали. Установка отменена.' >&2; exit 1; }
+fi
 if [[ "$CHECK_ONLY" == true ]]; then
     "$TASK_PYTHON" -c 'import sys; assert sys.version_info >= (3,11), "Нужен Python 3.11+"'
     echo "Проверка без изменений: режим=$MODE каталог=$TARGET интерфейс=$INTERFACE служба=$SERVICE"
@@ -150,6 +153,7 @@ if [[ "$INTERFACE" != preserve ]]; then
     [[ "$INTERFACE" == bot ]] && DISABLED=1
     printf '[Service]\nEnvironment=AWG_WEB_DISABLED=%s\n' "$DISABLED" > "$MODE_DROPIN"
 fi
+if [[ -f "$SOURCE/BUILD.json" ]]; then install -m 644 "$SOURCE/BUILD.json" "$TARGET/BUILD.json"; else rm -f "$TARGET/BUILD.json"; fi
 systemd-analyze verify "$UNIT"
 systemctl daemon-reload
 systemctl enable "$SERVICE"
@@ -160,5 +164,8 @@ trap - ERR
 echo "Бот установлен. Backup: $BACKUP"
 echo "Откройте Telegram и отправьте /servers. Логи: journalctl -u $SERVICE -n 100 --no-pager"
 if [[ -n "$DOMAIN" ]]; then
-    AWG_INSTALL_DIR="$TARGET" AWG_SERVICE_NAME="$SERVICE" AWG_PYTHON="$VENV/bin/python" bash "$SOURCE/scripts/install-miniapp.sh" "$DOMAIN" "$PUBLIC_IP"
+    if ! AWG_INSTALL_DIR="$TARGET" AWG_SERVICE_NAME="$SERVICE" AWG_PYTHON="$VENV/bin/python" bash "$SOURCE/scripts/install-miniapp.sh" "$DOMAIN" "$PUBLIC_IP"; then
+        echo "Бот обновлён и работает, но настройка HTTPS не завершилась. Не запускайте установку заново: проверьте DNS/прокси и повторите scripts/install-miniapp.sh. Backup: $BACKUP" >&2
+        exit 1
+    fi
 fi
