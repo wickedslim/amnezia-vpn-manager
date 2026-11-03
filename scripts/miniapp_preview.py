@@ -114,8 +114,23 @@ def create_demo():
     # Demo-only outer middleware: replaces credentials and labels every response.
     import hashlib,hmac,json
     from urllib.parse import urlencode
+    update_demo={'phase':'idle','enabled':True}
     @web.middleware
     async def demo(request,handler):
+        if request.path.startswith('/api/updates'):
+            if request.path.endswith('/changelog'):
+                path=Path(__file__).resolve().parents[1]/'CHANGELOG.md'
+                return web.json_response({'text':path.read_text() if path.exists() else '# Changelog\nДемонстрационная версия.'})
+            # Fully fictional update flow. Never invoke the real updater from demo.
+            if request.path.endswith('/preferences'):update_demo['enabled']=(await request.json())['enabled']
+            if request.path.endswith('/prepare'):return web.json_response({'nonce':'DEMO','version':'2.0.0-beta.99'})
+            if request.path.endswith('/start'):
+                update_demo['phase']='queued'
+                return web.json_response({'phase':'queued','version':'2.0.0-beta.99'},status=202)
+            phase=update_demo['phase']
+            if phase in ['queued','downloading','checking','installing','verifying']:
+                update_demo['phase']=['queued','downloading','checking','installing','verifying','complete'][['queued','downloading','checking','installing','verifying'].index(phase)+1]
+            return web.json_response({'current':'2.0.0-beta.5','checked':time.time(),'error':False,'enabled':update_demo['enabled'],'release':{'version':'2.0.0-beta.99'},'job':{'phase':phase,'version':'2.0.0-beta.99'}})
         pairs={'auth_date':str(int(time.time())),'user':json.dumps({'id':0})}
         secret=hmac.new(b'WebAppData',b'DEMO_ONLY',hashlib.sha256).digest()
         pairs['hash']=hmac.new(secret,'\n'.join(f'{k}={v}' for k,v in sorted(pairs.items())).encode(),hashlib.sha256).hexdigest()
