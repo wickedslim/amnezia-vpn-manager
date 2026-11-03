@@ -27,17 +27,6 @@ done
 if [[ -n "$DOMAIN" && "$INTERFACE" == bot ]]; then
     echo '--bot-only нельзя совмещать с --domain.' >&2; exit 1
 fi
-if [[ "$MODE" == fresh && -z "$DOMAIN" && "$INTERFACE" == preserve ]]; then
-    if [[ -t 0 ]]; then
-        read -r -p 'Настроить Mini App вместе с ботом? [y/N] ' answer
-        if [[ "$answer" =~ ^[yYдД]$ ]]; then
-            read -r -p 'Домен Mini App: ' DOMAIN
-            [[ -n "$DOMAIN" ]] || { echo 'Домен не задан.' >&2; exit 1; }
-            read -r -p 'Публичный IP (Enter для адресов сетевых интерфейсов): ' PUBLIC_IP
-        else INTERFACE=bot; fi
-    else INTERFACE=bot; fi
-fi
-[[ -z "$DOMAIN" ]] || INTERFACE=miniapp
 [[ "$(uname -s)" == Linux && ( "$EUID" -eq 0 || "$CHECK_ONLY" == true ) ]] || { echo 'Нужны Linux, systemd и root (sudo).' >&2; exit 1; }
 [[ "$SERVICE" =~ ^[a-zA-Z0-9_.@-]+$ ]] || exit 1
 command -v systemctl >/dev/null
@@ -67,11 +56,24 @@ done
 if [[ -f "$SOURCE/SHA256SUMS" ]]; then
     (cd "$SOURCE" && sha256sum -c SHA256SUMS >/dev/null) || { echo 'Контрольные суммы релиза не совпали. Установка отменена.' >&2; exit 1; }
 fi
+[[ -z "$DOMAIN" ]] || INTERFACE=miniapp
 if [[ "$CHECK_ONLY" == true ]]; then
     "$TASK_PYTHON" -c 'import sys; assert sys.version_info >= (3,11), "Нужен Python 3.11+"'
     echo "Проверка без изменений: режим=$MODE каталог=$TARGET интерфейс=$INTERFACE служба=$SERVICE"
     exit 0
 fi
+# Ask only on an interactive install/update without explicit interface flags.
+# Preflight and unattended updates never prompt or change the existing mode.
+if [[ -z "$DOMAIN" && "$INTERFACE" == preserve ]]; then
+    if [[ -t 0 ]]; then
+        CURRENT_WEB="$(systemctl show "$SERVICE" -p Environment --value 2>/dev/null || true)"
+        PLAN="$("$TASK_PYTHON" "$SOURCE/scripts/miniapp-setup.py" "$CURRENT_WEB")"
+        DOMAIN="$("$TASK_PYTHON" -c 'import json,sys; print(json.loads(sys.argv[1]).get("domain",""))' "$PLAN")"
+        PUBLIC_IP="$("$TASK_PYTHON" -c 'import json,sys; print(json.loads(sys.argv[1]).get("ip",""))' "$PLAN")"
+    fi
+    if [[ "$MODE" == fresh && -z "$DOMAIN" ]]; then INTERFACE=bot; fi
+fi
+[[ -z "$DOMAIN" ]] || INTERFACE=miniapp
 if command -v apt-get >/dev/null; then
     apt-get update
     DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv ca-certificates curl

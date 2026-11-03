@@ -5,18 +5,18 @@
 ## Обновление одной командой
 
 ```bash
-bash -c 'set -e; run_root() { if [ "$EUID" -eq 0 ]; then "$@"; else sudo "$@"; fi; }; command -v git >/dev/null || { run_root apt-get update; run_root apt-get install -y git ca-certificates; }; task_dir=$(mktemp -d); trap "rm -rf -- \"$task_dir\"" EXIT; git -c credential.helper= clone --depth 1 https://github.com/wickedslim/amnezia-vpn-manager.git "$task_dir"; run_root bash "$task_dir/update.sh"'
+bash -c 'set -e; run_root() { if [ "$EUID" -eq 0 ]; then "$@"; else sudo "$@"; fi; }; command -v git >/dev/null || { run_root apt-get update; run_root apt-get install -y git ca-certificates; }; task_dir=$(mktemp -d); trap "rm -rf -- \"$task_dir\"" EXIT; GIT_TERMINAL_PROMPT=0 git clone --depth 1 https://github.com/wickedslim/amnezia-vpn-manager.git "$task_dir"; run_root bash "$task_dir/update.sh"'
 ```
 
 Команда скачивает актуальную ветку `main` в новую временную папку, запускает установщик и удаляет только эту временную копию после завершения. Если Git отсутствует, установит Git и сертификаты через apt. Запускайте в терминале VPS (Ubuntu/Debian); если вы не root, потребуется sudo.
 
-**Репозиторий приватный:** сначала примите приглашение. Git запросит GitHub-логин и `Password`: сюда вводится **личный access token GitHub**, а не пароль аккаунта и не токен Telegram-бота. Ввод скрытый; команда отключает сохранение токена через Git credential helper. Не вставляйте токен в URL или текст команды. Подробнее — [авторизация GitHub по HTTPS](https://docs.github.com/en/get-started/git-basics/about-remote-repositories#cloning-with-https-urls). Если на сервере уже настроен SSH-доступ к GitHub, замените HTTPS-адрес на `git@github.com:wickedslim/amnezia-vpn-manager.git`.
+Репозиторий открытый: аккаунт GitHub, приглашение и токен для скачивания не нужны.
 
-Текущий режим (бот / бот с Mini App) сохранится. Скрипт создаст резервную копию перед заменой кода. Для отключения Mini App добавьте `--bot-only` после `"$task_dir/update.sh"` внутри одинарных кавычек. Если скачивание или авторизация завершатся ошибкой, установщик не запустится.
+Текущий режим (бот / бот с Mini App) сохранится. Скрипт создаст резервную копию перед заменой кода. Для отключения Mini App добавьте `--bot-only` после `"$task_dir/update.sh"` внутри одинарных кавычек. Если скачивание завершится ошибкой, установщик не запустится.
 
 ## Получить отдельную копию новой версии вручную
 
-Скачайте свежий ZIP из приватного репозитория и распакуйте в **отдельную** папку. Не распаковывайте поверх рабочего каталога бота.
+Скачайте свежий ZIP из репозитория и распакуйте в **отдельную** папку. Не распаковывайте поверх рабочего каталога бота.
 
 При использовании Git обновляйте отдельный checkout:
 
@@ -41,7 +41,9 @@ sudo bash update.sh --bot-only
 
 Веб-API отключится, кнопка Mini App сменится меню команд. База, статистика и конфиги сохранятся. Настройки Caddy/DNS автоматически не удаляются: прокси может обслуживать другие сайты. При необходимости удалите только свой блок домена вручную.
 
-Чтобы впервые включить Mini App при обновлении:
+Начиная с beta.5, для перехода с обычного бота запустите `sudo bash update.sh` в интерактивном SSH-терминале. Выберите **1 — свой домен** или **2 — бесплатный DuckDNS**, направьте адрес на IP VPS с ботом и введите его в мастере. После проверки DNS продолжится настройка HTTPS. [Пошаговая инструкция](MINIAPP.ru.md#переход-с-обычного-бота-на-mini-app-с-beta5).
+
+Для подключения Mini App без мастера:
 
 ```bash
 sudo bash update.sh --domain vpn.example.com --ip 203.0.113.10
