@@ -16,6 +16,7 @@ from aiohttp import web
 
 from . import audit
 from .build import build_info
+from .updates import Updates
 from .access import Access
 from .domain import Server, validate_name
 from .ui import connection
@@ -77,6 +78,7 @@ class MiniApp:
     def __init__(self, settings, store, service):
         self.settings, self.store, self.service = settings, store, service
         self.access = Access(store, settings.admin_id)
+        self.updates = Updates(Path(__file__).resolve().parents[2],build_info()["version"])
         self.server_add_lock = asyncio.Lock()
         self.refresh_lock = asyncio.Lock()
         self.last_refresh = 0.0
@@ -87,6 +89,32 @@ class MiniApp:
         self.reboots = Reboots(store, service)
         self.reissues = Reissues(store, service)
         self.actor_controllers = {}
+
+    async def update_changelog(self,request):
+        path=Path(__file__).resolve().parents[2]/'CHANGELOG.md'
+        try:text=path.read_text()[:100000]
+        except OSError:text='Changelog этой установки пока недоступен.'
+        return web.json_response({'text':text})
+    async def update_info(self,request):
+        self.require_owner(request['uid'])
+        enabled=self.store.get_pref('update_notifications',True)
+        if request.method=='PATCH':
+            body=await request.json()
+            if type(body.get('enabled')) is not bool:raise ValueError()
+            enabled=body['enabled'];self.store.set_pref('update_notifications',enabled)
+        info=await self.updates.check(request.method=='POST') if enabled or request.method=='POST' else (self.updates.cached or {'current':self.updates.current,'release':None,'checked':None,'error':False})
+        return web.json_response({**info,'enabled':enabled,'job':self.updates.status()})
+    async def update_prepare(self,request):
+        self.require_owner(request['uid'])
+        return web.json_response(await self.updates.prepare())
+    async def update_start(self,request):
+        self.require_owner(request['uid'])
+        body=await request.json()
+        nonce=body.get('nonce')
+        if not isinstance(nonce,str) or len(nonce)>100:raise ValueError()
+        try:result=await self.updates.start(nonce)
+        except ValueError as e:raise ManagerError(str(e)) from None
+        return web.json_response(result,status=202)
 
     def require_owner(self,uid):
         if uid!=self.settings.admin_id:
@@ -311,6 +339,12 @@ def create_web_app(settings, store, service):
         return web.FileResponse(STATIC / name)
     app.router.add_post(r'/api/servers/{sid:\d+}/reboot/prepare', api.prepare_reboot)
     app.router.add_post(r'/api/servers/{sid:\d+}/reboot', api.reboot)
+    app.router.add_get('/api/updates/changelog',api.update_changelog)
+    app.router.add_get('/api/updates',api.update_info)
+    app.router.add_post('/api/updates/check',api.update_info)
+    app.router.add_patch('/api/updates/preferences',api.update_info)
+    app.router.add_post('/api/updates/prepare',api.update_prepare)
+    app.router.add_post('/api/updates/start',api.update_start)
     app.router.add_get('/api/preferences', api.preferences)
     app.router.add_post('/api/preferences', api.preferences)
     app.router.add_get('/', index)
