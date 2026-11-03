@@ -54,3 +54,74 @@ test('all servers monthly scope aggregates distinct peers',async({page})=>{
   await page.locator('#stats-server').selectOption('1');
   await expect(page.locator('.stats-summary .big-number')).toHaveText('3Кб');
 });
+for(const width of [320,393])test(`daily line chart drilldown at ${width}px`,async({page})=>{
+ await page.setViewportSize({width,height:852});
+ await page.goto('/#/stats/1');
+ await page.locator('[data-report-client]').first().click();
+ await expect(page.locator('.daily-card')).toBeVisible();
+ await expect(page.locator('#daily-month')).toBeVisible();
+ const picker=page.locator('[data-daily-picker]');await picker.focus();await picker.press('Home');
+ await expect(picker).toHaveValue('0');
+ await picker.press('ArrowRight');await expect(picker).toHaveValue('1');
+ await expect(page.locator('.daily-detail h3')).toContainText('2');
+ await expect(page.locator('.daily-line-chart')).toBeVisible();
+ expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBeTruthy();
+ await page.locator('.back-link').click();
+ await expect(page.locator('#stats-server')).toHaveValue('1');
+ await page.goto('/#/server/1');
+ await expect(page.locator('.server-daily .daily-card')).toBeVisible();
+ await expect(page.locator('a[href="#/daily/1"]')).toHaveCount(0);
+ expect(await page.locator('.server-daily').evaluate(el=>el.previousElementSibling.textContent.includes('Скорость трафика'))).toBeTruthy();
+});
+
+test('daily lines leave unobserved gaps and allow selecting them',async({page})=>{
+ await page.route('**/daily?month=*',route=>route.fulfill({json:{name:'Demo',server_name:'Server',since:Date.now()/1000,days:[
+ {day:'2026-11-01',rx:10,tx:2,observed:true},
+ {day:'2026-11-02',rx:20,tx:3,observed:true},
+ {day:'2026-11-03',rx:0,tx:0,observed:false},
+ {day:'2026-11-04',rx:30,tx:5,observed:true},
+ {day:'2026-11-05',rx:40,tx:8,observed:true}]}}));
+ await page.goto('/#/daily/1');
+ await expect(page.locator('.daily-line.rx')).toHaveCount(2);
+ await expect(page.locator('.daily-area.rx')).toHaveCount(2);
+ await expect(page.locator('.daily-area.tx')).toHaveCount(2);
+ const picker=page.locator('[data-daily-picker]');await picker.focus();await picker.press('Home');await picker.press('ArrowRight');await picker.press('ArrowRight');
+ await expect(page.locator('.daily-detail')).toContainText('Нет замеров');
+ await expect(page.locator('.daily-selected')).toHaveCount(0);
+});
+
+test('server inline chart hover shows traffic tooltip and respects motion preference',async({page})=>{
+ await page.goto('/#/server/1');
+ const picker=page.locator('[data-daily-picker]');await expect(picker).toBeVisible();
+ await picker.scrollIntoViewIfNeeded();const rect=await picker.boundingBox();await page.mouse.move(rect.x+rect.width*.5,rect.y+rect.height*.5);
+ await expect(page.locator('.server-daily .daily-tooltip')).toBeVisible();
+ await expect(page.locator('.daily-detail h3')).toHaveText(await page.locator('.daily-tooltip strong').innerText());
+ await page.mouse.move(0,0);await expect(page.locator('.daily-tooltip')).toBeHidden();
+ await page.goto('/#/stats');const card=page.locator('.report-link').first();await card.hover();
+ expect(await card.evaluate(el=>getComputedStyle(el).transform)).not.toBe('none');
+ await page.emulateMedia({reducedMotion:'reduce'});
+ await expect.poll(()=>card.evaluate(el=>getComputedStyle(el).transform)).toBe('none');
+});
+test('month switcher navigates without allowing future months',async({page})=>{
+ await page.goto('/#/server/1');
+ const picker=page.locator('#daily-month');await expect(picker).toBeVisible();
+ const current=await picker.inputValue();
+ await expect(page.getByRole('button',{name:'Следующий месяц',exact:true})).toBeDisabled();
+ await page.getByRole('button',{name:'Предыдущий месяц',exact:true}).click();
+ await expect(picker).not.toHaveValue(current);
+ await page.getByRole('button',{name:'Следующий месяц',exact:true}).click();
+ await expect(picker).toHaveValue(current);
+ expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBeTruthy();
+});
+
+test('card hover moves without changing surface color or shadow',async({page})=>{
+ for(const [route,selector] of [['/','a.server-card'],['/#/clients','.client-card'],['/#/stats','.report-link']]){
+  await page.goto(route);const card=page.locator(selector).first();await expect(card).toBeVisible();
+  await page.mouse.move(0,0);
+  const before=await card.evaluate(el=>{const s=getComputedStyle(el);return {bg:s.backgroundColor,shadow:s.boxShadow}});
+  await card.hover();
+  await expect.poll(()=>card.evaluate(el=>getComputedStyle(el).transform)).toBe('matrix(1, 0, 0, 1, 0, -3)');
+  const after=await card.evaluate(el=>{const s=getComputedStyle(el);return {bg:s.backgroundColor,shadow:s.boxShadow}});
+  expect(after).toEqual(before);
+ }
+});
