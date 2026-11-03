@@ -11,7 +11,7 @@ def sources(root):
             if p.is_file() and not p.is_symlink() and '__pycache__' not in p.parts and p.suffix in allowed:
                 files[p.relative_to(root).as_posix()]=p.read_bytes()
     for p in root.iterdir():
-        if p.is_file() and not p.is_symlink() and (p.name in {'README.md','CHANGELOG.md','INSTALL.ru.md','UPDATE.ru.md','USAGE.ru.md','ADMINS.ru.md','ROLLBACK.ru.md','MINIAPP.ru.md','UI_RULES.md','THIRD_PARTY_NOTICES.md','VALIDATION.ru.md'} or p.name in {'install.sh','update.sh','requirements.txt','VERSION','LICENSE','package.json','package-lock.json','playwright.config.js'}):
+        if p.is_file() and not p.is_symlink() and (p.name in {'README.md','CHANGELOG.md','INSTALL.ru.md','UNINSTALL.ru.md','UPDATE.ru.md','USAGE.ru.md','ADMINS.ru.md','ROLLBACK.ru.md','MINIAPP.ru.md','UI_RULES.md','THIRD_PARTY_NOTICES.md','VALIDATION.ru.md'} or p.name in {'install.sh','uninstall.sh','update.sh','requirements.txt','VERSION','LICENSE','package.json','package-lock.json','playwright.config.js'}):
             files[p.name]=p.read_bytes()
     files['awg/bot_manager.py']=(root/'awg/bot_manager.py').read_bytes()
     return files
