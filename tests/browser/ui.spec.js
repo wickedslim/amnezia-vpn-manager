@@ -125,3 +125,35 @@ test('card hover moves without changing surface color or shadow',async({page})=>
   expect(after).toEqual(before);
  }
 });
+
+test('daily totals follow the chart and dark filled navigation is white',async({page})=>{
+ await page.goto('/#/daily/1/9');await expect(page.locator('.daily-card .daily-line-chart')).toBeVisible();
+ expect(await page.locator('.daily-card').evaluate(el=>el.querySelector('.daily-line-chart').getBoundingClientRect().bottom<el.querySelector('.metric-pair').getBoundingClientRect().top)).toBeTruthy();
+ await page.goto('/#/settings');await page.locator('[data-pref=mode][data-value=dark]').click();
+ await expect(page.locator('.bottom-nav a.active')).toHaveCSS('color','rgb(255, 255, 255)');
+ await expect(page.locator('.preference-segment [aria-pressed=true]').first()).toHaveCSS('color','rgb(255, 255, 255)');
+});
+test('owner update form has real stages and follows reduced motion',async({page})=>{
+ await page.goto('/#/settings');await expect(page.locator('.update-section')).toBeVisible();
+ await page.getByRole('button',{name:'Обновить',exact:true}).click();
+ await expect(page.locator('#modal')).toContainText('Обновить менеджер?');
+ await page.locator('#modal').getByRole('button',{name:'Обновить',exact:true}).click();
+ await expect(page.locator('.update-steps')).toBeVisible();
+ await expect(page.locator('.update-motion')).toHaveClass(/running/);
+ await page.emulateMedia({reducedMotion:'reduce'});
+ await expect(page.locator('.update-motion svg')).toHaveCSS('animation-name','none');
+ await page.getByRole('button',{name:'Свернуть',exact:true}).click();
+ await expect(page.locator('#modal')).not.toBeVisible();
+});
+
+test('what is new stays in app and returns to the update confirmation',async({page})=>{
+ await page.goto('/#/settings');await expect(page.locator('.update-section')).toBeVisible();
+ await page.getByRole('button',{name:'Обновить',exact:true}).click();
+ await page.locator('#modal').getByRole('button',{name:'Что нового?',exact:true}).click();
+ await expect(page.locator('#modal h2')).toHaveText('Что нового?');
+ await expect(page.locator('.changelog-content')).toContainText('Changelog');
+ await page.locator('#modal').getByRole('button',{name:'Назад',exact:true}).click();
+ await expect(page.locator('#modal h2')).toHaveText('Обновить менеджер?');
+ await expect(page.locator('#modal').getByRole('button',{name:'Обновить',exact:true})).toBeEnabled();
+ await expect(page).toHaveURL(/#\/settings$/);
+});
