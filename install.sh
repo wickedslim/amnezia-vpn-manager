@@ -155,6 +155,7 @@ if [[ "$INTERFACE" != preserve ]]; then
     [[ "$INTERFACE" == bot ]] && DISABLED=1
     printf '[Service]\nEnvironment=AWG_WEB_DISABLED=%s\n' "$DISABLED" > "$MODE_DROPIN"
 fi
+if [[ -f "$SOURCE/CHANGELOG.md" ]]; then install -m 644 "$SOURCE/CHANGELOG.md" "$TARGET/CHANGELOG.md"; fi
 if [[ -f "$SOURCE/BUILD.json" ]]; then install -m 644 "$SOURCE/BUILD.json" "$TARGET/BUILD.json"; else rm -f "$TARGET/BUILD.json"; fi
 systemd-analyze verify "$UNIT"
 systemctl daemon-reload
