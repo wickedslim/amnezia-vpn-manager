@@ -41,6 +41,18 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         await self.client.start_server();self.headers={'Authorization':'tma '+signed()}
     async def asyncTearDown(self):
         await self.client.close();self.store.close();self.tmp.cleanup()
+    async def test_updates_owner_only(self):
+        self.store.set_pref('telegram_admins',[{'id':124,'name':'admin'}])
+        for path in ['/api/updates','/api/updates/check','/api/updates/prepare','/api/updates/start']:
+            method=self.client.get if path=='/api/updates' else self.client.post
+            response=await method(path,headers={'Authorization':'tma '+signed(uid=124)})
+            self.assertEqual(response.status,403)
+        from unittest.mock import patch
+        with patch('manager.updates.fetch_releases',return_value=[]):
+            response=await self.client.get('/api/updates',headers=self.headers)
+            self.assertEqual(response.status,200);self.assertIsNone((await response.json())['release'])
+        response=await self.client.patch('/api/updates/preferences',headers=self.headers,json={'enabled':False})
+        self.assertFalse((await response.json())['enabled'])
     async def test_no_api_without_auth(self):
         for path in ['/api/overview',f'/api/servers/{self.server.id}/clients/1/config']:
             response=await self.client.get(path);self.assertEqual(response.status,401)
