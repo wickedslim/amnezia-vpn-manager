@@ -5,7 +5,7 @@ import math
 import sys
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from types import SimpleNamespace
@@ -32,6 +32,15 @@ def create_demo():
             month = datetime.now(ZoneInfo('Europe/Samara')).strftime('%Y-%m')
             for row in store.clients(s.id):
                 c.execute('UPDATE monthly SET rx=?,tx=? WHERE client_id=? AND month=?', (row['total_rx'],row['total_tx'],row['id'],month))
+    today=datetime.now(ZoneInfo('Europe/Samara'))
+    previous=today.replace(day=1)-timedelta(days=1)
+    with store.transaction() as c:
+        for client in c.execute('SELECT id FROM clients').fetchall():
+            for month, count in [(previous,previous.day),(today,today.day)]:
+                for day in range(1,count+1):
+                    date=f"{month:%Y-%m}-{day:02d}"
+                    c.execute('INSERT OR REPLACE INTO daily VALUES (?,?,?,?)',(client['id'],date,(day*client['id']%7+1)*5000000,(day*client['id']%11+1)*50000000))
+    store.set_pref('daily_since',datetime(previous.year,previous.month,1,tzinfo=ZoneInfo('Europe/Samara')).timestamp())
     class DemoRunner:
         installed=False
         def __init__(self,*args):pass
