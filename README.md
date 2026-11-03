@@ -39,6 +39,18 @@ bash -c 'set -e; run_root() { if [ "$EUID" -eq 0 ]; then "$@"; else sudo "$@"; f
 
 [Подробности обновления и отката](UPDATE.ru.md) · [Новая установка одной командой](INSTALL.ru.md)
 
+## Удалить одной командой
+
+Запустите в интерактивном SSH-терминале VPS, где установлен менеджер. Нужен `curl` и root либо `sudo`.
+
+```bash
+bash -c 'set -e; task_script=$(mktemp); trap "rm -f -- \"$task_script\"" EXIT; curl -fsSL https://raw.githubusercontent.com/wickedslim/amnezia-vpn-manager/main/uninstall.sh -o "$task_script"; if [ "$EUID" -eq 0 ]; then bash "$task_script"; else sudo bash "$task_script"; fi'
+```
+
+Скрипт покажет службу и каталог и попросит подтвердить удаление. Для нестандартной установки задайте `AWG_SERVICE_NAME` и `AWG_INSTALL_DIR` при ручном запуске.
+
+[Подробности удаления и восстановления](UNINSTALL.ru.md).
+
 ## Быстрый запуск
 
 Ubuntu 24.04 / Debian 12, systemd, Python 3.11+. VPN должен быть заранее установлен через Amnezia; установщик менеджера не устанавливает и не перезапускает VPN.
