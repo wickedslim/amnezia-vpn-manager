@@ -17,6 +17,28 @@
 
 В инструкциях выше есть **команды в одну строку**: скачивание в отдельную временную папку и запуск установки/обновления. Репозиторий открытый: авторизация GitHub для скачивания не нужна.
 
+## Установить одной командой
+
+Для нового бота на Ubuntu/Debian. AmneziaWG уже должен быть установлен; установщик менеджера не устанавливает сам VPN.
+
+```bash
+bash -c 'set -e; run_root() { if [ "$EUID" -eq 0 ]; then "$@"; else sudo "$@"; fi; }; command -v git >/dev/null || { run_root apt-get update; run_root apt-get install -y git ca-certificates; }; task_dir=$(mktemp -d); trap "rm -rf -- \"$task_dir\"" EXIT; GIT_TERMINAL_PROMPT=0 git clone --depth 1 https://github.com/wickedslim/amnezia-vpn-manager.git "$task_dir"; run_root bash "$task_dir/install.sh"'
+```
+
+Команда скачает публичный проект и запустит установщик. Понадобятся токен Telegram-бота и числовой Telegram ID владельца. Выберите только чат-бот, Mini App со своим доменом или бесплатный адрес DuckDNS. Не запускайте один Telegram-токен на двух серверах одновременно. [Подробная инструкция](INSTALL.ru.md).
+
+## Обновить одной командой
+
+Запустите в SSH-терминале VPS с установленным ботом (Ubuntu/Debian):
+
+```bash
+bash -c 'set -e; run_root() { if [ "$EUID" -eq 0 ]; then "$@"; else sudo "$@"; fi; }; command -v git >/dev/null || { run_root apt-get update; run_root apt-get install -y git ca-certificates; }; task_dir=$(mktemp -d); trap "rm -rf -- \"$task_dir\"" EXIT; GIT_TERMINAL_PROMPT=0 git clone --depth 1 https://github.com/wickedslim/amnezia-vpn-manager.git "$task_dir"; run_root bash "$task_dir/update.sh"'
+```
+
+Команда скачает актуальную ветку `main` во временную папку, создаст резервную копию и обновит бота. Сохраняются серверы, клиенты, конфиги и статистика; перезапускается только бот, VPN продолжает работать. Аккаунт и токен GitHub не нужны. Для обычного бота мастер предложит подключить Mini App через свой домен или бесплатный DuckDNS; существующая панель сохранится. Без интерактивного терминала режим сохраняется.
+
+[Подробности обновления и отката](UPDATE.ru.md) · [Новая установка одной командой](INSTALL.ru.md)
+
 ## Быстрый запуск
 
 Ubuntu 24.04 / Debian 12, systemd, Python 3.11+. VPN должен быть заранее установлен через Amnezia; установщик менеджера не устанавливает и не перезапускает VPN.
