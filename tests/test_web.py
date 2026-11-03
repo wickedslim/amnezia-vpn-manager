@@ -167,3 +167,19 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         response=await self.client.post('/api/servers',headers=self.headers,json={**data,'name':'Broken','connection':'203.0.113.6'})
         self.assertEqual(response.status,500)
         self.assertEqual(len(self.store.servers()),2)
+
+    async def test_daily_auth_directions_and_deleted_client(self):
+        month=self.store.connection.execute('SELECT month FROM monthly LIMIT 1').fetchone()[0]
+        cid=self.store.clients(self.server.id)[0]['id']
+        path=f'/api/servers/{self.server.id}/clients/{cid}/daily?month={month}'
+        self.assertEqual((await self.client.get(path)).status,401)
+        with self.store.transaction() as c:
+            c.execute('UPDATE daily SET rx=20,tx=80 WHERE client_id=?',(cid,))
+            c.execute('UPDATE clients SET present=0 WHERE id=?',(cid,))
+        response=await self.client.get(path,headers=self.headers)
+        self.assertEqual(response.status,200)
+        report=await response.json();self.assertTrue(report['deleted'])
+        day=next(d for d in report['days'] if d['observed'])
+        self.assertEqual((day['rx'],day['tx']),(80,20))
+        response=await self.client.get(f'/api/servers/{self.server.id}/daily?month=bad',headers=self.headers)
+        self.assertEqual(response.status,400)
