@@ -211,6 +211,11 @@ class MiniApp:
         body = await request.json()
         return web.json_response(self.speedtests.start(sid, body.get('action')), status=202)
 
+    async def daily(self, request):
+        sid = int(request.match_info['sid'])
+        cid = request.match_info.get('cid')
+        return web.json_response(self.store.daily_report(sid, request.query.get('month', ''), int(cid) if cid else None))
+
     async def monthly(self, request):
         sid = int(request.match_info['sid'])
         self.store.server(sid)
@@ -301,7 +306,7 @@ def create_web_app(settings, store, service):
         return web.FileResponse(STATIC / 'index.html')
     async def asset(request):
         name = request.match_info['name']
-        if name not in {'app.js', 'app.css', 'preferences.js', 'dom.js'}:
+        if name not in {'app.js', 'app.css', 'preferences.js', 'dom.js', 'daily.js'}:
             raise web.HTTPNotFound()
         return web.FileResponse(STATIC / name)
     app.router.add_post(r'/api/servers/{sid:\d+}/reboot/prepare', api.prepare_reboot)
@@ -335,6 +340,8 @@ def create_web_app(settings, store, service):
         await api.speedtests.close()
     app.on_startup.append(startup)
     app.on_cleanup.append(cleanup)
+    app.router.add_get(r'/api/servers/{sid:\d+}/daily', api.daily)
+    app.router.add_get(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/daily', api.daily)
     app.router.add_get(r'/api/servers/{sid:\d+}/monthly', api.monthly)
     app.router.add_post(r'/api/servers/{sid:\d+}/clients', api.create)
     app.router.add_delete(r'/api/servers/{sid:\d+}/clients/{cid:\d+}', api.delete)

@@ -49,11 +49,13 @@ class Store:
             CREATE TABLE IF NOT EXISTS legacy_configs (public_key TEXT PRIMARY KEY, config TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS legacy_limits (server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE, name TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(server_id,name));
             CREATE TABLE IF NOT EXISTS samples (server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE, ts INTEGER NOT NULL, rx INTEGER NOT NULL, tx INTEGER NOT NULL, online INTEGER NOT NULL, PRIMARY KEY(server_id,ts));
+            CREATE TABLE IF NOT EXISTS daily (client_id INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE, day TEXT NOT NULL, rx INTEGER NOT NULL DEFAULT 0, tx INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(client_id,day));
             CREATE TABLE IF NOT EXISTS monthly (client_id INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE, month TEXT NOT NULL, rx INTEGER NOT NULL DEFAULT 0, tx INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(client_id,month));
             CREATE INDEX IF NOT EXISTS samples_ts ON samples(ts);
             CREATE TABLE IF NOT EXISTS connections (client_id INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE, endpoint TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY(client_id,endpoint));
         """)
         self.connection.execute("INSERT OR IGNORE INTO preferences VALUES (?,?)", ("monthly_since", json.dumps(int(time.time()))))
+        self.connection.execute("INSERT OR IGNORE INTO preferences VALUES (?,?)", ("daily_since", json.dumps(int(time.time()))))
         self.connection.commit()
 
     @contextmanager
@@ -228,6 +230,9 @@ class Store:
                 monthly_rx = rx if previous and previous["last_rx"] is not None else 0
                 monthly_tx = tx if previous and previous["last_tx"] is not None else 0
                 conn.execute("INSERT INTO monthly VALUES (?,?,?,?) ON CONFLICT(client_id,month) DO UPDATE SET rx=rx+excluded.rx,tx=tx+excluded.tx", (cid, month, monthly_rx, monthly_tx))
+                day = datetime.fromtimestamp(now, ZoneInfo("Europe/Samara")).strftime("%Y-%m-%d")
+                if p.runtime_present:
+                    conn.execute("INSERT INTO daily VALUES (?,?,?,?) ON CONFLICT(client_id,day) DO UPDATE SET rx=rx+excluded.rx,tx=tx+excluded.tx", (cid, day, monthly_rx, monthly_tx))
                 imported = conn.execute("SELECT config FROM legacy_configs WHERE public_key=?", (p.public_key,)).fetchone()
                 if imported and fields(imported[0].split("[Peer]", 1)[-1]).get("PublicKey") == server_public:
                     conn.execute("UPDATE clients SET config=COALESCE(config,?) WHERE server_id=? AND public_key=?", (imported[0], sid, p.public_key))
@@ -278,3 +283,27 @@ class Store:
         with self.lock:
             rows = self.connection.execute(f"SELECT c.id,c.name,c.allowed_ips,c.present,m.rx,m.tx FROM monthly m JOIN clients c ON c.id=m.client_id WHERE c.server_id=? AND m.month=? ORDER BY {order} DESC,c.id", (sid, month)).fetchall()
         return [dict(row) for row in rows]
+
+    def daily_report(self, sid: int, month: str, cid=None) -> dict:
+        import calendar
+        import re
+        if not re.fullmatch(r"[0-9]{4}-(0[1-9]|1[0-2])", month) or not 1 <= int(month[:4]) <= 9999:
+            raise ManagerError("Некорректный месяц.")
+        server = self.server(sid)
+        client = None
+        if cid is not None:
+            with self.lock:
+                client = self.connection.execute("SELECT name,present FROM clients WHERE server_id=? AND id=?", (sid,cid)).fetchone()
+            if client is None:
+                raise ManagerError("Конфиг не найден на этом сервере.")
+        with self.lock:
+            rows = self.connection.execute("SELECT d.day,SUM(d.rx) AS rx,SUM(d.tx) AS tx FROM daily d JOIN clients c ON c.id=d.client_id WHERE c.server_id=? AND d.day LIKE ? AND (? IS NULL OR c.id=?) GROUP BY d.day ORDER BY d.day", (sid, month+'-%', cid, cid)).fetchall()
+        indexed = {r['day']: r for r in rows}
+        days = []
+        for number in range(1, calendar.monthrange(int(month[:4]), int(month[5:]))[1]+1):
+            day = f"{month}-{number:02d}"
+            row = indexed.get(day)
+            days.append(dict(day=day, rx=row['tx'] if row else 0, tx=row['rx'] if row else 0, observed=row is not None))
+        return dict(month=month, server_id=sid, server_name=server.name, client_id=cid,
+                    name=client['name'] if client else server.name, deleted=bool(client and not client['present']),
+                    since=self.get_pref('daily_since'), days=days)
