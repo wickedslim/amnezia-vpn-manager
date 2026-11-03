@@ -45,3 +45,12 @@ test('monthly summary shows download and upload for the selected month',async({p
   await expect(page.locator('.stats-summary .big-number')).toHaveText('7Кб');
   expect((await page.locator('.stats-summary').boundingBox()).height).toBeLessThan(350);
 });
+test('all servers monthly scope aggregates distinct peers',async({page})=>{
+  await page.route('**/api/servers/*/monthly?**',route=>route.fulfill({json:{clients:[{id:1,name:'Same',ip:'10.0.0.2',rx:1024,tx:2048,deleted:false}]}}));
+  await page.goto('/#/stats');
+  await expect(page.locator('#stats-server')).toHaveValue('all');
+  await expect(page.locator('.stats-summary .big-number')).toHaveText('6Кб');
+  await expect(page.locator('[data-report-client]')).toHaveCount(2);
+  await page.locator('#stats-server').selectOption('1');
+  await expect(page.locator('.stats-summary .big-number')).toHaveText('3Кб');
+});
