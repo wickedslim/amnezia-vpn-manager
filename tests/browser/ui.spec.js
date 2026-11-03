@@ -126,11 +126,11 @@ test('card hover moves without changing surface color or shadow',async({page})=>
  }
 });
 
-test('daily totals follow the chart and dark filled navigation is white',async({page})=>{
+test('daily totals follow the chart and navigation uses the accent',async({page})=>{
  await page.goto('/#/daily/1/9');await expect(page.locator('.daily-card .daily-line-chart')).toBeVisible();
  expect(await page.locator('.daily-card').evaluate(el=>el.querySelector('.daily-line-chart').getBoundingClientRect().bottom<el.querySelector('.metric-pair').getBoundingClientRect().top)).toBeTruthy();
  await page.goto('/#/settings');await page.locator('[data-pref=mode][data-value=dark]').click();
- await expect(page.locator('.bottom-nav a.active')).toHaveCSS('color','rgb(255, 255, 255)');
+ await expect(page.locator('.bottom-nav a.active')).toHaveCSS('color','rgb(255, 67, 2)');
  await expect(page.locator('.preference-segment [aria-pressed=true]').first()).toHaveCSS('color','rgb(255, 255, 255)');
 });
 test('owner update form has real stages and follows reduced motion',async({page})=>{
