@@ -71,7 +71,7 @@ class DomainTests(unittest.TestCase):
 
     def test_card_without_handshake_renders_and_escapes(self):
         text = client_text("<server>", {"name":"<client>","handshake":0,"total_rx":2,"total_tx":3,"expires":None,"allowed_ips":"10.0.0.2/32","traffic_limit":None})
-        self.assertIn("Нет соединений", text)
+        self.assertIn("🔴 Не в сети", text)
         self.assertIn("&lt;client&gt;", text)
         self.assertNotIn("?d", text)
 

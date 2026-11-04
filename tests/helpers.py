@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+import shlex
 from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
@@ -35,7 +36,10 @@ def fixture(root: Path, names=("office401", "office401")):
     binary = root / "bin"
     binary.mkdir(exist_ok=True)
     fake = binary / "awg"
-    fake.write_text(f"#!{sys.executable}\n" + FAKE_WG)
+    # A shebang cannot contain an interpreter path with spaces (common on macOS).
+    program = binary / "fake_awg.py"
+    program.write_text(FAKE_WG)
+    fake.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(program))} \"$@\"\n")
     fake.chmod(0o755)
     return public
 

@@ -37,10 +37,46 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.store.sync(self.server.id,[Peer('public','client','10.0.0.2/32','',received=100,sent=200)],'server')
         self.store.set_pref(f'health:{self.server.id}',{'ok':True,'updated':time.time()})
         self.service=SimpleNamespace(overview=AsyncMock(),snapshot=AsyncMock(),create_client=AsyncMock(),delete_client=AsyncMock())
-        self.client=TestClient(TestServer(create_web_app(SimpleNamespace(token='test-token',admin_id=123),self.store,self.service)))
+        self.bot=SimpleNamespace(send_document=AsyncMock())
+        self.client=TestClient(TestServer(create_web_app(SimpleNamespace(token='test-token',admin_id=123),self.store,self.service,self.bot)))
         await self.client.start_server();self.headers={'Authorization':'tma '+signed()}
     async def asyncTearDown(self):
         await self.client.close();self.store.close();self.tmp.cleanup()
+    async def test_overview_retains_connection_history_without_claiming_online(self):
+        stamp = int(time.time()) - 3600
+        self.store.sync(self.server.id, [Peer('public','client','10.0.0.2/32','',handshake=stamp)], 'server')
+        self.store.sync(self.server.id, [Peer('public','client','10.0.0.2/32','',handshake=0)], 'server')
+        response = await self.client.get('/api/overview', headers=self.headers)
+        client = (await response.json())['servers'][0]['clients'][0]
+        self.assertEqual(client['handshake'], 0)
+        self.assertEqual(client['last_handshake'], stamp)
+        self.assertTrue(client['has_history'])
+        self.assertFalse(client['online'])
+
+    async def test_new_client_has_no_invented_connection_history(self):
+        self.store.sync(self.server.id, [Peer('new','new','10.0.0.3/32','')], 'server')
+        response = await self.client.get('/api/overview', headers=self.headers)
+        client = (await response.json())['servers'][0]['clients'][0]
+        self.assertFalse(client['has_history'])
+        self.assertEqual(client['last_handshake'], 0)
+
+    async def test_backup_sends_archive_only_to_owner(self):
+        self.service.backup=AsyncMock(return_value=b'private archive')
+        self.store.set_pref('telegram_admins',[{'id':124,'name':'admin'}])
+        path=f'/api/servers/{self.server.id}/backup'
+        response=await self.client.post(path,headers={'Authorization':'tma '+signed(uid=124)})
+        self.assertEqual(response.status,403)
+        self.service.backup.assert_not_awaited()
+        self.bot.send_document.assert_not_awaited()
+        response=await self.client.post(path,headers=self.headers)
+        self.assertEqual(response.status,200)
+        self.assertEqual(await response.json(),{'sent':True})
+        self.service.backup.assert_awaited_once_with(self.server.id)
+        self.bot.send_document.assert_awaited_once()
+        recipient, document=self.bot.send_document.await_args.args
+        self.assertEqual(recipient,123)
+        self.assertEqual(document.data,b'private archive')
+
     async def test_updates_owner_only(self):
         self.store.set_pref('telegram_admins',[{'id':124,'name':'admin'}])
         for path in ['/api/updates','/api/updates/check','/api/updates/prepare','/api/updates/start']:

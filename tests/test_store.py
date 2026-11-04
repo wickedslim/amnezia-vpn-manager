@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 from manager.domain import ManagerError, Peer, Server
 from manager.migration import migrate
 from manager.store import Store
+from manager.views import client_status
 from helpers import keypair
 
 
@@ -57,6 +58,15 @@ class StoreTests(unittest.TestCase):
         self.store.update_server(Server(self.one.id,"renamed",host="newhost"))
         self.assertEqual(self.store.server(self.one.id).name,"renamed")
         self.assertEqual(len(self.store.clients(self.one.id)),1)
+
+    def test_reset_preserves_prior_connection_status(self):
+        self.store.sync(self.one.id, [Peer("used", "used", "", "", handshake=100)], "server")
+        self.store.sync(self.one.id, [Peer("used", "used", "", ""), Peer("new", "new", "", "")], "server")
+        clients = {client["name"]: client for client in self.store.clients(self.one.id)}
+        self.assertEqual(clients["used"]["handshake"], 0)
+        self.assertEqual(clients["used"]["last_handshake"], 100)
+        self.assertEqual(client_status(clients["used"])[0], "🔴")
+        self.assertEqual(client_status(clients["new"])[0], "⚪")
 
     def test_connection_history_is_scoped_to_client(self):
         self.store.sync(self.one.id,[Peer("key","name","ip","",handshake=100,endpoint="203.0.113.1:1234")],"server")
