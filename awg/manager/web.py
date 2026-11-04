@@ -13,13 +13,14 @@ from pathlib import Path
 from urllib.parse import parse_qsl
 
 from aiohttp import web
+from aiogram.exceptions import TelegramAPIError
 
 from . import audit
 from .build import build_info
 from .updates import Updates
 from .access import Access
 from .domain import Server, validate_name
-from .ui import connection
+from .ui import connection, send_backup
 from .reboot import Reboots
 from .reissue import Reissues
 from .preferences import normalize_preferences
@@ -60,6 +61,8 @@ def validate_init_data(raw: str, token: str, admin_id: int, now=None) -> int:
 def client_json(c):
     return dict(id=c['id'], name=c['name'], ip=c['allowed_ips'], rx=c['total_tx'], tx=c['total_rx'],
                 handshake=c['handshake'], online=bool(c['handshake'] and 0 <= time.time()-c['handshake'] <= 180),
+                last_handshake=max(c['handshake'], c.get('last_handshake', 0)),
+                has_history=bool(c['handshake'] or c.get('last_handshake') or c['total_rx'] or c['total_tx']),
                 limit=c['traffic_limit'], expires=c['expires'], has_config=bool(c['config']))
 
 
@@ -75,8 +78,10 @@ def policy(body):
 
 
 class MiniApp:
-    def __init__(self, settings, store, service):
+    def __init__(self, settings, store, service, bot=None):
         self.settings, self.store, self.service = settings, store, service
+        self.bot = bot
+        self.backup_lock = asyncio.Lock()
         self.access = Access(store, settings.admin_id)
         self.updates = Updates(Path(__file__).resolve().parents[2],build_info()["version"])
         self.server_add_lock = asyncio.Lock()
@@ -119,6 +124,19 @@ class MiniApp:
     def require_owner(self,uid):
         if uid!=self.settings.admin_id:
             raise web.HTTPForbidden(text=json.dumps({'error':'Это действие доступно только владельцу бота.'},ensure_ascii=False),content_type='application/json')
+
+    async def backup(self, request):
+        self.require_owner(request['uid'])
+        if self.bot is None:
+            raise ManagerError('Отправка резервной копии недоступна.')
+        if self.backup_lock.locked():
+            raise ManagerError('Резервная копия уже отправляется.')
+        async with self.backup_lock:
+            try:
+                await send_backup(self.bot, self.service, self.settings.admin_id, int(request.match_info['sid']))
+            except TelegramAPIError:
+                raise ManagerError('Telegram не принял файл. Проверьте, что чат с ботом открыт, и повторите.') from None
+        return web.json_response({'sent': True})
 
     async def audit_log(self,request):
         self.require_owner(request['uid'])
@@ -294,8 +312,8 @@ class MiniApp:
         return web.json_response({'config': c['config']})
 
 
-def create_web_app(settings, store, service):
-    api = MiniApp(settings, store, service)
+def create_web_app(settings, store, service, bot=None):
+    api = MiniApp(settings, store, service, bot)
 
     @web.middleware
     async def guard(request, handler):
@@ -337,6 +355,7 @@ def create_web_app(settings, store, service):
         if name not in {'app.js', 'app.css', 'preferences.js', 'dom.js', 'daily.js'}:
             raise web.HTTPNotFound()
         return web.FileResponse(STATIC / name)
+    app.router.add_post(r'/api/servers/{sid:\d+}/backup', api.backup)
     app.router.add_post(r'/api/servers/{sid:\d+}/reboot/prepare', api.prepare_reboot)
     app.router.add_post(r'/api/servers/{sid:\d+}/reboot', api.reboot)
     app.router.add_get('/api/updates/changelog',api.update_changelog)
@@ -386,8 +405,8 @@ def create_web_app(settings, store, service):
     return app
 
 
-async def start_web(settings, store, service, host, port):
-    runner = web.AppRunner(create_web_app(settings, store, service), access_log=None)
+async def start_web(settings, store, service, host, port, bot=None):
+    runner = web.AppRunner(create_web_app(settings, store, service, bot), access_log=None)
     await runner.setup()
     try:
         await web.TCPSite(runner, host, port).start()

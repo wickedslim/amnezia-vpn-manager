@@ -26,7 +26,7 @@ from .service import VPNService
 from .reissue import Reissues
 from .store import Store
 from . import audit
-from .views import ago, client_text, e, keyboard, rates, size, sparkline
+from .views import ago, client_status, client_text, e, keyboard, rates, size, sparkline
 
 log = logging.getLogger(__name__)
 PAGE_SIZE = 10
@@ -60,6 +60,15 @@ class AccessMiddleware(BaseMiddleware):
         finally:
             audit.context.reset(audit_token)
             if self.actor:self.actor.reset(token)
+
+
+async def send_backup(bot, service, owner_id: int, sid: int):
+    content = await service.backup(sid)
+    filename = f"amnezia-{sid}-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}.zip"
+    await bot.send_document(
+        owner_id, BufferedInputFile(content, filename=filename),
+        caption="Резервная копия: база всех серверов и конфигурация выбранного VPN. Содержит секретные ключи и SSH-реквизиты.",
+    )
 
 
 def connection(value: str) -> tuple[str, int, str]:
@@ -207,7 +216,7 @@ class UI:
         total_tx = samples[-1]["tx"] if samples else 0
         text = (
             f"<b>{e(server.name)}</b>\n🟢 Сервер доступен\n\n"
-            f"<b>Клиенты</b>\n🟢 {active} в сети  ·  ⚪ {len(clients)-active} не в сети\nВсего: <b>{len(clients)}</b>\n\n"
+            f"<b>Клиенты</b>\n🟢 {active} в сети  ·  🔴 {len(clients)-active} не в сети\nВсего: <b>{len(clients)}</b>\n\n"
             f"<b>VPN-трафик клиентов</b>\n↓ На устройства {size(total_tx)}\n↑ С устройств {size(total_rx)}\n"
             f"Скорость: ↓ {size(rx)}/с  ↑ {size(tx)}/с\n\n"
             f"Обновлено: {ago(snapshot.timestamp)}\nФоновый замер: каждые 60 с; ручное обновление — дополнительный замер.\nНаправления со стороны клиентов. Трафик накопительный, включая начальные счётчики VPN. Для календарного периода откройте статистику по месяцам."
@@ -227,8 +236,7 @@ class UI:
         rows = []
         client_buttons = []
         for c in clients[page*PAGE_SIZE:(page+1)*PAGE_SIZE]:
-            online = c["handshake"] > 0 and 0 <= time.time() - c["handshake"] <= 180
-            icon = "🟢" if online else ("⚪" if c["handshake"] else "🟠")
+            icon, _ = client_status(c)
             client_buttons.append((f"{icon} {c['name'][:32]}", f"c:{sid}:{c['id']}"))
         rows.extend(client_buttons[i:i+2] for i in range(0,len(client_buttons),2))
         if not query:
@@ -240,7 +248,7 @@ class UI:
             rows.append(pager)
         rows += [[("＋ Клиент", f"newclient:{sid}"), ("Поиск", f"search:{sid}")], [("↻ Обновить", f"lr:{sid}:{page}")], [("‹ Сервер", f"s:{sid}"), ("⌂ Главная", "home")]]
         title = f"Поиск: {e(query)}" if query else "Клиенты"
-        text = f"<b>{e(server.name)} › {title}</b>\n\nНайдено: <b>{len(clients)}</b>  ·  {page+1}/{pages}\n🟢 В сети · ⚪ Не в сети · 🟠 Ещё не подключался"
+        text = f"<b>{e(server.name)} › {title}</b>\n\nНайдено: <b>{len(clients)}</b>  ·  {page+1}/{pages}\n🟢 В сети · 🔴 Не в сети · ⚪ Нет истории подключения"
         if not clients:
             text += "\n\nКлиентов пока нет." if not query else "\n\nСовпадений не найдено."
         await self.panel(text, keyboard(*rows), revision)
@@ -342,8 +350,7 @@ class UI:
                     await self.bot.send_document(self.admin_id, BufferedInputFile(vpn.encode(), filename=f"{filename}-vpn.txt"))
             elif action == "backup":
                 sid = int(parts[1])
-                content = await self.service.backup(sid)
-                await self.bot.send_document(self.admin_id, BufferedInputFile(content, filename=f"amnezia-{sid}-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}.zip"), caption="Резервная копия: база всех серверов и конфигурация выбранного VPN. Содержит секретные ключи и SSH-реквизиты.")
+                await send_backup(self.bot, self.service, self.admin_id, sid)
             elif action == "ip":
                 await self.ip_info(int(parts[1]), int(parts[2]), revision)
             else:

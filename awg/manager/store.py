@@ -54,6 +54,10 @@ class Store:
             CREATE INDEX IF NOT EXISTS samples_ts ON samples(ts);
             CREATE TABLE IF NOT EXISTS connections (client_id INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE, endpoint TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY(client_id,endpoint));
         """)
+        columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(clients)")}
+        if "last_handshake" not in columns:
+            self.connection.execute("ALTER TABLE clients ADD COLUMN last_handshake INTEGER NOT NULL DEFAULT 0")
+            self.connection.execute("UPDATE clients SET last_handshake=handshake")
         self.connection.execute("INSERT OR IGNORE INTO preferences VALUES (?,?)", ("monthly_since", json.dumps(int(time.time()))))
         self.connection.execute("INSERT OR IGNORE INTO preferences VALUES (?,?)", ("daily_since", json.dumps(int(time.time()))))
         self.connection.commit()
@@ -221,9 +225,9 @@ class Store:
                     tx = (p.sent if previous["last_tx"] is None or p.sent < previous["last_tx"] else p.sent - previous["last_tx"]) if p.runtime_present else 0
                     last_rx = p.received if p.runtime_present else previous["last_rx"]
                     last_tx = p.sent if p.runtime_present else previous["last_tx"]
-                    conn.execute("UPDATE clients SET name=?,allowed_ips=?,total_rx=total_rx+?,total_tx=total_tx+?,last_rx=?,last_tx=?,handshake=?,endpoint=?,present=1 WHERE id=?", (p.name, p.allowed_ips, rx, tx, last_rx, last_tx, p.handshake, p.endpoint, previous["id"]))
+                    conn.execute("UPDATE clients SET name=?,allowed_ips=?,total_rx=total_rx+?,total_tx=total_tx+?,last_rx=?,last_tx=?,handshake=?,last_handshake=MAX(last_handshake,?),endpoint=?,present=1 WHERE id=?", (p.name, p.allowed_ips, rx, tx, last_rx, last_tx, p.handshake, p.handshake, p.endpoint, previous["id"]))
                 else:
-                    conn.execute("INSERT INTO clients(server_id,public_key,name,allowed_ips,total_rx,total_tx,last_rx,last_tx,handshake,endpoint) VALUES (?,?,?,?,?,?,?,?,?,?)", (sid, p.public_key, p.name, p.allowed_ips, p.received, p.sent, p.received if p.runtime_present else None, p.sent if p.runtime_present else None, p.handshake, p.endpoint))
+                    conn.execute("INSERT INTO clients(server_id,public_key,name,allowed_ips,total_rx,total_tx,last_rx,last_tx,handshake,last_handshake,endpoint) VALUES (?,?,?,?,?,?,?,?,?,?,?)", (sid, p.public_key, p.name, p.allowed_ips, p.received, p.sent, p.received if p.runtime_present else None, p.sent if p.runtime_present else None, p.handshake, p.handshake, p.endpoint))
                 month = datetime.fromtimestamp(now, ZoneInfo("Europe/Samara")).strftime("%Y-%m")
                 cid = conn.execute("SELECT id FROM clients WHERE server_id=? AND public_key=?", (sid, p.public_key)).fetchone()[0]
                 # First observation is a baseline, not historical monthly traffic.

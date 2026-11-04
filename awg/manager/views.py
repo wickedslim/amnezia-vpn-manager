@@ -63,16 +63,26 @@ def rates(samples: list[dict]) -> tuple[float, float]:
     return max(0, last["rx"] - first["rx"]) / seconds, max(0, last["tx"] - first["tx"]) / seconds
 
 
+def client_status(client: dict) -> tuple[str, str]:
+    handshake = client["handshake"]
+    if handshake > 0 and 0 <= time.time() - handshake <= 180:
+        return "🟢", "В сети"
+    if handshake or client.get("last_handshake") or client["total_rx"] or client["total_tx"]:
+        return "🔴", "Не в сети"
+    return "⚪", "Нет истории подключения"
+
+
 def client_text(server_name: str, client: dict) -> str:
-    online = client["handshake"] > 0 and 0 <= time.time() - client["handshake"] <= 180
-    status = "🟢 В сети" if online else ("⚪ Не в сети" if client["handshake"] else "🟠 Нет соединений")
+    icon, status = client_status(client)
+    last_handshake = max(client["handshake"], client.get("last_handshake", 0))
+    last_seen = ago(last_handshake) if last_handshake else "Нет данных"
     used = client["total_rx"] + client["total_tx"]
     end = client["expires"]
     remaining = "Без срока" if end is None else (f"Осталось {max(0, int((end-time.time()) / 3600))} ч" if end > time.time() else "Срок истёк")
     expiry = "" if end is None else f"\nДо {datetime.fromtimestamp(end, timezone.utc):%d.%m.%Y %H:%M} UTC"
     return (
         f"<b>{e(client['name'])}</b>\n{e(server_name)} › Клиенты\n\n"
-        f"{status}\nПоследнее соединение: {ago(client['handshake'])}\n"
+        f"{icon} {status}\nПоследнее соединение: {last_seen}\n"
         f"VPN-адрес: <code>{e(client['allowed_ips'] or '—')}</code>\n\n"
         f"<b>Трафик клиента · накопительный</b>\n↓ На устройство {size(client['total_tx'])}\n"
         f"↑ С устройства {size(client['total_rx'])}\nВсего: <b>{size(used)}</b>\n\n"

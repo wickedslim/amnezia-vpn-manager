@@ -15,7 +15,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.middlewares.base import BaseRequestMiddleware
 from aiogram.exceptions import TelegramConflictError, TelegramNetworkError, TelegramUnauthorizedError
-from aiogram.types import BotCommand, MenuButtonWebApp, WebAppInfo, MenuButtonCommands
+from aiogram.types import BotCommand, MenuButtonWebApp, WebAppInfo
 
 from .config import Settings, initialize
 from .domain import ManagerError
@@ -86,14 +86,11 @@ async def run(settings: Settings, store: Store) -> int:
     background = polling = conflict_wait = None
     web_runner = None
     try:
-        bot_only = os.environ.get("AWG_WEB_DISABLED") == "1"
-        web_port = None if bot_only else os.environ.get("AWG_WEB_PORT")
+        web_port = os.environ.get("AWG_WEB_PORT")
         if web_port:
             from .web import start_web
-            web_runner = await start_web(settings, store, service, os.environ.get("AWG_WEB_HOST", "127.0.0.1"), int(web_port))
-        web_url = "" if bot_only else os.environ.get("AWG_WEB_URL", "")
-        if bot_only:
-            await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+            web_runner = await start_web(settings, store, service, os.environ.get("AWG_WEB_HOST", "127.0.0.1"), int(web_port), bot=bot)
+        web_url = os.environ.get("AWG_WEB_URL", "")
         if web_url:
             from urllib.parse import urlsplit
             parsed = urlsplit(web_url)
