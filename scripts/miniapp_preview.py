@@ -117,6 +117,8 @@ def create_demo():
     update_demo={'phase':'idle','enabled':True}
     @web.middleware
     async def demo(request,handler):
+        if request.method == 'POST' and request.path.endswith('/backup'):
+            return web.json_response({'sent': True})
         if request.path.startswith('/api/updates'):
             if request.path.endswith('/changelog'):
                 path=Path(__file__).resolve().parents[1]/'CHANGELOG.md'
