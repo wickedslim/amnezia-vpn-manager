@@ -4,8 +4,13 @@ test('DOM updates retain focus, input, ordering and SVG',async({page})=>{
 });
 test('client filters survive detail and return',async({page})=>{
   await page.goto('/#/clients');const search=page.getByRole('searchbox');await search.fill('Kolida');
-  await page.getByRole('combobox',{name:'Фильтр по серверу'}).selectOption('1');
-  await page.locator('.client-card').filter({hasText:'Kolida1'}).click();await page.locator('.back-link').click();
+  await page.locator('#client-server-menu summary').click();
+  await page.locator('#client-server-menu [data-filter-option="1"]').click();
+  await page.locator('.client-card').filter({hasText:'Kolida1'}).click();
+  await expect(page.locator('.daily-card .daily-line-chart')).toBeVisible();
+  await expect(page.locator('.daily-card #daily-month')).toBeVisible();
+  await expect(page.locator('a[href^="#/daily/"]')).toHaveCount(0);
+  await page.locator('.back-link').click();
   await expect(search).toHaveValue('Kolida');await expect(page.locator('#client-server')).toHaveValue('1');
 });
 test('settings keep focus and honor reduced motion',async({page})=>{
@@ -23,7 +28,7 @@ for(const width of [320,393])test(`layout and targets at ${width}px`,async({page
 test('late monthly response cannot replace a different route',async({page})=>{
   let release;const gate=new Promise(r=>release=r);
   await page.route('**/api/servers/*/monthly?**',async route=>{await gate;await route.continue()});
-  await page.goto('/#/stats');await expect(page.locator('#stats-month')).toBeVisible();
+  await page.goto('/#/stats');await expect(page.locator('#stats-month-menu summary')).toBeVisible();
   await page.locator('[data-tab="clients"]').click();release();
   await expect(page.getByRole('heading',{name:'Клиенты',exact:true})).toBeVisible();
   await expect(page.locator('#search')).toBeVisible();
@@ -51,7 +56,8 @@ test('all servers monthly scope aggregates distinct peers',async({page})=>{
   await expect(page.locator('#stats-server')).toHaveValue('all');
   await expect(page.locator('.stats-summary .big-number')).toHaveText('6Кб');
   await expect(page.locator('[data-report-client]')).toHaveCount(2);
-  await page.locator('#stats-server').selectOption('1');
+  await page.locator('#stats-server-menu summary').click();
+  await page.locator('#stats-server-menu [data-filter-option="1"]').click();
   await expect(page.locator('.stats-summary .big-number')).toHaveText('3Кб');
 });
 for(const width of [320,393])test(`daily line chart drilldown at ${width}px`,async({page})=>{
@@ -128,7 +134,8 @@ test('card hover moves without changing surface color or shadow',async({page})=>
 
 test('daily totals follow the chart and navigation uses the accent',async({page})=>{
  await page.goto('/#/daily/1/9');await expect(page.locator('.daily-card .daily-line-chart')).toBeVisible();
- expect(await page.locator('.daily-card').evaluate(el=>el.querySelector('.daily-line-chart').getBoundingClientRect().bottom<el.querySelector('.metric-pair').getBoundingClientRect().top)).toBeTruthy();
+ await expect(page.locator('.daily-card .metric-pair')).toHaveCount(1);
+ await expect(page.locator('.daily-detail .metric-pair')).toBeVisible();
  await page.goto('/#/settings');await page.locator('[data-pref=mode][data-value=dark]').click();
  await expect(page.locator('.bottom-nav a.active')).toHaveCSS('color','rgb(255, 67, 2)');
  await expect(page.locator('.preference-segment [aria-pressed=true]').first()).toHaveCSS('color','rgb(255, 255, 255)');
