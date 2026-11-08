@@ -318,8 +318,8 @@ function dailyComparison(report){
     ?`${range(current)}: ${sum(current)} · ${range(earlier)}: ${sum(earlier)}`
     :'За оба периода пока недостаточно данных.';
   return `<section class="surface chart-card traffic-comparison"><h2>Сравнение трафика</h2><div class="toolbar" role="group" aria-label="Период сравнения">
-    <button type="button" class="secondary" data-comparison="week" aria-pressed="${weekly}">С прошлой неделей</button>
-    <button type="button" class="secondary" data-comparison="month" aria-pressed="${!weekly}">С прошлым месяцем</button>
+    <button type="button" class="secondary full" data-comparison="week" aria-pressed="${weekly}">С прошлой неделей</button>
+    <button type="button" class="secondary full" data-comparison="month" aria-pressed="${!weekly}">С прошлым месяцем</button>
     </div><p class="footnote" aria-live="polite">${summary}</p></section>`;
 }
 function embeddedDaily(){return `<div class="server-daily">${state.daily?dailyView(state.daily,state.dailyDay,{esc,fmt,splitSize,compact:true,controls:dailyMonthControl()})+dailyComparison(state.daily):state.dailyError?reportFailure('daily',state.dailyError):`<section class="surface chart-card daily-card daily-loading" role="status"><h2>Трафик по дням</h2>${dailyMonthControl()}<div class="daily-loading-chart">Загружаю дневную статистику…</div></section>`}</div>`}
