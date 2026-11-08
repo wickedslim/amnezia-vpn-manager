@@ -67,6 +67,12 @@ def create_demo():
             return asyncio.Lock()
         traffic_enabled = {1: True}
 
+        async def start_service_traffic_install(self, sid, *, enable=False):
+            self.traffic_enabled.setdefault(sid, False)
+            if enable:
+                self.traffic_enabled[sid] = True
+            return await self.service_traffic_control(sid)
+
         async def service_traffic_control(self, sid, enabled=None):
             if sid not in self.traffic_enabled:
                 return {"state": "missing"}
