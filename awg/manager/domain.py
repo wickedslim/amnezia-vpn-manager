@@ -82,7 +82,7 @@ def parse_config(text: str, names: dict[str, str] | None = None) -> WGConfig:
     return WGConfig(parts[0], interface, peers)
 
 
-def parse_dump(text: str, interface: str) -> tuple[str, dict[str, dict]]:
+def parse_dump(text: str, interface: str, *, include_addresses=False) -> tuple[str, dict[str, dict]]:
     public_key = ""
     peers = {}
     header_seen = False
@@ -101,6 +101,8 @@ def parse_dump(text: str, interface: str) -> tuple[str, dict[str, dict]]:
                     "endpoint": "" if values[3] == "(none)" else values[3],
                     "handshake": int(values[5]), "received": int(values[6]), "sent": int(values[7]),
                 }
+                if include_addresses and values[4] != '(none)':
+                    peers[values[1]]['runtime_ips'] = values[4]
             except ValueError as exc:
                 raise ManagerError("Сервер вернул некорректные счётчики VPN.") from exc
     if not public_key:

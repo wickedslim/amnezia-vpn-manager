@@ -135,7 +135,7 @@ printf '\\036MANAGER_RUNTIME\\n'
 
 
 def write_peer(runner: Runner, *, before: str, after: str, table_before: str, table_after: str,
-               interface: str, key: str, allowed_ips: str, psk: str, remove=False, old_peer="", replace_key=""):
+               interface: str, key: str, allowed_ips: str, psk: str, remove=False, old_peer="", replace_key="", restore_peer=False, add_peers=(), table_only=False):
     """Compare-and-swap persistent config, targeted runtime update, rollback on failure.
 
     Payload goes through stdin; private configuration never appears in process arguments.
@@ -146,11 +146,21 @@ def write_peer(runner: Runner, *, before: str, after: str, table_before: str, ta
     payload = b"".join(base64.b64encode(value.encode()) + b"\n" for value in values)
     action = f'"$WG" set {q(interface)} peer {q(key)} remove' if remove else f'"$WG" set {q(interface)} peer {q(key)} preshared-key "$tmp/psk" allowed-ips {q(allowed_ips)}'
     rollback = f'"$WG" addconf {q(interface)} "$tmp/peer"' if remove else f'"$WG" set {q(interface)} peer {q(key)} remove'
+    if restore_peer:
+        action = f'"$WG" addconf {q(interface)} "$tmp/peer"'
+    if add_peers:
+        from .domain import validate_key
+        action = f'"$WG" addconf {q(interface)} "$tmp/peer"'
+        rollback = "\n        ".join(
+            f'"$WG" set {q(interface)} peer {q(validate_key(peer))} remove || true' for peer in add_peers
+        )
     if replace_key:
         from .domain import validate_key
         validate_key(replace_key)
         action = f'"$WG" set {q(interface)} peer {q(replace_key)} remove\n' + action
         rollback = f'"$WG" set {q(interface)} peer {q(key)} remove || true\n        "$WG" addconf {q(interface)} "$tmp/peer"'
+    if table_only:
+        action = rollback = ":"
     script = f"""set -eu
 umask 077
 {WG_SELECT}

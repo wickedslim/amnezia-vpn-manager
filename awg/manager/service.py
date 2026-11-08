@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import hashlib
 import json
 import logging
 import re
@@ -11,12 +12,17 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from .domain import ManagerError, Server, WGConfig, allocate_address, client_config, parse_config, parse_dump, validate_key, validate_name
+from .domain import ManagerError, Server, WGConfig, allocate_address, client_config, fields, Peer, parse_config, parse_dump, validate_key, validate_name
 from .audit import audited
 from .store import Store
-from .transport import Runner, WG_SELECT, read_snapshot, write_peer
+from .transport import Runner, WG_SELECT, q, read_snapshot, write_peer
 
 log = logging.getLogger(__name__)
+
+TRAFFIC_COLLECTOR = "/opt/amnezia-service-traffic/collector.py"
+TRAFFIC_PYTHON = "/opt/amnezia-service-traffic/venv/bin/python"
+TRAFFIC_UNIT = "amnezia-service-traffic.service"
+TRAFFIC_RUNNING = {"active", "activating", "deactivating", "reloading"}
 
 
 def parse_table(text: str) -> list[dict]:
@@ -37,6 +43,7 @@ class Snapshot:
     table: list[dict]
     server_public: str
     timestamp: float
+    runtime_peers: dict
 
 
 class VPNService:
@@ -68,6 +75,60 @@ class VPNService:
                 finally:
                     raise
 
+    async def service_traffic(self, sid: int, window: str, public_key: str = ""):
+        server = self.store.server(sid)
+        args = ["report", server.container, Path(server.config_path).stem, "--window", window]
+        if public_key:
+            args.extend(["--peer", hashlib.sha256(public_key.encode()).hexdigest()])
+        command = (f"if [ -f {TRAFFIC_COLLECTOR} ]; then exec {TRAFFIC_PYTHON} {TRAFFIC_COLLECTOR} "
+                   + " ".join(map(q, args)) + "; fi")
+        async with self.lock(sid):
+            output = await self.worker(lambda: self.runner(sid).run(command, timeout=5))
+        return json.loads(output) if output else {"state": "disabled", "rows": []}
+
+    def _service_traffic_status(self, server: Server, runner: Runner) -> dict:
+        output = runner.run(
+            f"if [ -f {TRAFFIC_COLLECTOR} ]; then systemctl show "
+            f"-p LoadState -p ExecStart -p ActiveState -p UnitFileState {TRAFFIC_UNIT}; fi",
+            timeout=5,
+        )
+        props = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+        load = props.get("LoadState")
+        if not output or load == "not-found":
+            return {"state": "missing"}
+        expected = f"{TRAFFIC_PYTHON} {TRAFFIC_COLLECTOR} collect {server.container} {Path(server.config_path).stem}"
+        commands = re.findall(r"argv\[\]=(.*?) ;", props.get("ExecStart", ""))
+        if load != "loaded" or commands != [expected]:
+            return {"state": "unmanaged"}
+        activity = props.get("ActiveState")
+        mode = props.get("UnitFileState")
+        if (not server.local and server.username != "root") or mode not in {"enabled", "disabled", "enabled-runtime"}:
+            return {"state": "unmanaged"}
+        return {"state": "ready", "enabled": mode.startswith("enabled") or activity in TRAFFIC_RUNNING,
+                "running": activity in {"active", "reloading"}}
+
+    async def service_traffic_control(self, sid: int, enabled: bool | None = None) -> dict:
+        server = self.store.server(sid)
+
+        def control():
+            runner = self.runner(sid)
+            status = self._service_traffic_status(server, runner)
+            if enabled is None:
+                return status
+            if status["state"] != "ready":
+                raise ManagerError("Управление этим сборщиком недоступно.")
+            if enabled:
+                runner.run("systemctl is-active --quiet docker.service", timeout=5)
+            action = "enable" if enabled else "disable"
+            runner.run(f"systemctl --no-ask-password {action} --now {TRAFFIC_UNIT}", timeout=15)
+            result = self._service_traffic_status(server, runner)
+            if result.get("enabled") != enabled or (enabled and not result.get("running")):
+                raise ManagerError("Сборщик не перешёл в нужное состояние. Проверьте статус службы.")
+            return result
+
+        async with self.lock(sid):
+            return await self.worker(control)
+
     def _read(self, sid: int) -> Snapshot:
         server = self.store.server(sid)
         text, table_text, runtime = read_snapshot(self.runner(sid))
@@ -75,14 +136,23 @@ class VPNService:
         names = {c["clientId"]: c["userData"].get("clientName", "") for c in table}
         config = parse_config(text, names)
         interface = Path(server.config_path).stem
-        public, peers = parse_dump(runtime, interface)
+        public, peers = parse_dump(runtime, interface, include_addresses=True)
         for peer in config.peers:
             peer.runtime_present = peer.public_key in peers
             for key, value in peers.get(peer.public_key, {}).items():
-                setattr(peer, key, value)
-        snapshot = Snapshot(config, text, table_text, table, public, time.time())
+                if key != "runtime_ips":
+                    setattr(peer, key, value)
+        snapshot = Snapshot(config, text, table_text, table, public, time.time(), peers)
         self.store.reconcile_rotations(sid, {p.public_key for p in config.peers})
-        self.store.sync(sid, config.peers, public)
+        active = {peer.public_key for peer in config.peers}
+        saved = self.paused(sid)
+        restored = active & peers.keys() & saved.keys()
+        if restored:
+            saved = {key: item for key, item in saved.items() if key not in restored}
+            self.store.set_pref(f'paused_clients:{sid}', saved)
+        paused = [Peer(key, item['name'], item['ips'], item['block'], runtime_present=False)
+                  for key, item in saved.items() if key not in active]
+        self.store.sync(sid, config.peers + paused, public)
         self.store.set_pref(f"health:{sid}", {"ok": True, "updated": snapshot.timestamp})
         self.cache[sid] = snapshot
         return snapshot
@@ -142,13 +212,15 @@ printf '%s\\n' "$private" | "$WG" pubkey
                 if len(keys) != 3:
                     raise ManagerError("Не удалось сгенерировать ключи клиента.")
                 private, public, psk = map(validate_key, keys)
-                address = allocate_address(snapshot.config)
+                reserved = [Peer(key, item['name'], item['ips'], item['block'])
+                            for key, item in self.paused(sid).items()]
+                address = allocate_address(WGConfig(snapshot.config.header, snapshot.config.interface,
+                                                     snapshot.config.peers + reserved))
                 generated = client_config(snapshot.config, address, private, snapshot.server_public, psk, server.endpoint)
                 # Persist the private key before touching the remote server.
                 with self.store.transaction() as conn:
                     cursor = conn.execute("INSERT INTO clients(server_id,public_key,name,allowed_ips,config,expires,traffic_limit,present) VALUES (?,?,?,?,?,?,?,0)", (sid, public, name, address, generated, int(time.time()) + duration if duration else None, limit))
                     cid = cursor.lastrowid
-                from .domain import Peer
                 block = f"[Peer]\n# {name}\nPublicKey = {public}\nPresharedKey = {psk}\nAllowedIPs = {address}\n"
                 peer = Peer(public, name, address, block)
                 table = snapshot.table + [{"clientId": public, "userData": {"clientName": name, "creationDate": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())}}]
@@ -160,6 +232,70 @@ printf '%s\\n' "$private" | "$WG" pubkey
                 return self.store.client(sid, cid)
             return await self.worker(operation)
 
+    def paused(self, sid):
+        return self.store.get_pref(f'paused_clients:{sid}', {})
+
+    @audited('client.pause')
+    async def set_paused(self, sid: int, cid: int, pause: bool):
+        async with self.lock(sid):
+            def operation():
+                snapshot = self._read(sid)
+                client = self.store.client(sid, cid)
+                key = client['public_key']
+                saved = self.paused(sid)
+                peer = next((item for item in snapshot.config.peers if item.public_key == key), None)
+                if pause:
+                    if peer is None and key in saved:
+                        if key not in snapshot.runtime_peers:
+                            return
+                        item = saved[key]
+                        peer = Peer(key, item['name'], item['ips'], item['block'])
+                    if peer is None:
+                        raise ManagerError('Клиент больше не существует на сервере.')
+                    saved[key] = {'name': peer.name, 'ips': peer.allowed_ips, 'block': peer.block}
+                    # Save the recovery material before removing the peer.
+                    self.store.set_pref(f'paused_clients:{sid}', saved)
+                    peers = [item for item in snapshot.config.peers if item.public_key != key]
+                else:
+                    if key not in saved:
+                        return
+                    if (client['expires'] is not None and client['expires'] <= time.time()
+                            or client['traffic_limit'] is not None and client['total_rx'] + client['total_tx'] >= client['traffic_limit']):
+                        raise ManagerError('Сначала продлите срок или измените лимит клиента.')
+                    item = saved[key]
+                    peer = Peer(key, item['name'], item['ips'], item['block'])
+                    active = next((other for other in snapshot.config.peers if other.public_key == key), None)
+                    if active is not None:
+                        if key in snapshot.runtime_peers and fields(active.block) == fields(peer.block):
+                            saved.pop(key)
+                            self.store.set_pref(f'paused_clients:{sid}', saved)
+                            return
+                        raise ManagerError('Конфиг клиента уже изменён на сервере.')
+                    if key in snapshot.runtime_peers:
+                        raise ManagerError('Клиент уже существует в активном интерфейсе.')
+                    from ipaddress import ip_network
+                    networks = [ip_network(ip.strip(), strict=False) for ip in peer.allowed_ips.split(',') if ip.strip()]
+                    occupied = [other.allowed_ips for other in snapshot.config.peers]
+                    occupied += [other.get('runtime_ips', '') for other in snapshot.runtime_peers.values()]
+                    for ips in occupied:
+                        for ip in ips.split(','):
+                            if ip.strip() and any(network.overlaps(ip_network(ip.strip(), strict=False)) for network in networks):
+                                raise ManagerError('Адрес клиента занят. Освободите его перед возобновлением.')
+                    peers = snapshot.config.peers + [peer]
+                try:
+                    write_peer(self.runner(sid), before=snapshot.text, after=snapshot.config.render(peers),
+                               table_before=snapshot.table_text, table_after=snapshot.table_text,
+                               interface=Path(self.store.server(sid).config_path).stem, key=key,
+                               allowed_ips=peer.allowed_ips, psk=fields(peer.block).get('PresharedKey', ''),
+                               remove=pause, old_peer=peer.block, restore_peer=not pause)
+                finally:
+                    self.cache.pop(sid, None)
+                if not pause:
+                    saved.pop(key)
+                    self.store.set_pref(f'paused_clients:{sid}', saved)
+                self._read(sid)
+            await self.worker(operation)
+
     @audited('client.delete')
     async def delete_client(self, sid: int, cid: int):
         async with self.lock(sid):
@@ -169,7 +305,21 @@ printf '%s\\n' "$private" | "$WG" pubkey
                 key = client["public_key"]
                 peer = next((p for p in snapshot.config.peers if p.public_key == key), None)
                 if peer is None:
-                    raise ManagerError("Клиент уже удалён с сервера.")
+                    saved = self.paused(sid)
+                    if key not in saved:
+                        raise ManagerError("Клиент уже удалён с сервера.")
+                    if key in snapshot.runtime_peers:
+                        raise ManagerError('Клиент присутствует в активном интерфейсе. Проверьте сервер.')
+                    table = [entry for entry in snapshot.table if entry['clientId'] != key]
+                    write_peer(self.runner(sid), before=snapshot.text, after=snapshot.text,
+                               table_before=snapshot.table_text, table_after=json.dumps(table, ensure_ascii=False),
+                               interface=Path(self.store.server(sid).config_path).stem, key=key,
+                               allowed_ips='', psk='', remove=True, old_peer=saved[key]['block'],
+                               table_only=True)
+                    saved.pop(key)
+                    self.store.set_pref(f'paused_clients:{sid}', saved)
+                    self._read(sid)
+                    return
                 server = self.store.server(sid)
                 remaining = [p for p in snapshot.config.peers if p.public_key != key]
                 table = [entry for entry in snapshot.table if entry["clientId"] != key]
@@ -177,6 +327,10 @@ printf '%s\\n' "$private" | "$WG" pubkey
                     write_peer(self.runner(sid), before=snapshot.text, after=snapshot.config.render(remaining), table_before=snapshot.table_text, table_after=json.dumps(table, ensure_ascii=False), interface=Path(server.config_path).stem, key=key, allowed_ips="", psk="", remove=True, old_peer=peer.block)
                 finally:
                     self.cache.pop(sid, None)
+                saved = self.paused(sid)
+                if key in saved:
+                    saved.pop(key)
+                    self.store.set_pref(f'paused_clients:{sid}', saved)
                 self._read(sid)
             await self.worker(operation)
 
@@ -202,7 +356,7 @@ printf '%s\\n' "$private" | "$WG" pubkey
                     raise ManagerError('Срок или лимит клиента исчерпан. Сначала измените ограничения.')
                 peer = next((p for p in snapshot.config.peers if p.public_key == expected_key), None)
                 if not peer:
-                    raise ManagerError('Клиент больше не существует на сервере.')
+                    raise ManagerError('Возобновите доступ перед перевыпуском конфига.')
                 server = self.store.server(sid)
                 if not server.endpoint:
                     raise ManagerError('У сервера не задан внешний адрес для клиентской конфигурации.')
@@ -257,13 +411,94 @@ printf '%s\\n' "$private" | "$WG" pubkey
                 expired = client["expires"] is not None and client["expires"] <= time.time()
                 used = client["total_rx"] + client["total_tx"]
                 exhausted = client["traffic_limit"] is not None and used >= client["traffic_limit"]
-                if expired or exhausted:
+                if (expired or exhausted) and client['public_key'] not in self.paused(sid):
                     try:
                         await self.delete_client(sid, client["id"])
                         notifications.append((sid, f"Клиент {client['name']} удалён: {'истёк срок' if expired else 'исчерпан трафик'}."))
                     except ManagerError:
                         log.warning("Не удалось применить ограничение: server=%d client=%d", sid, client["id"])
         return notifications
+
+    @audited('backup.restore')
+    async def restore_backup(self, sid: int, archive: bytes, expected=None):
+        """Restore missing peers without overwriting existing peers or manager data."""
+        async with self.lock(sid):
+            def operation():
+                from ipaddress import ip_interface, ip_network
+                try:
+                    with zipfile.ZipFile(io.BytesIO(archive)) as zipped:
+                        info = zipped.getinfo('server/wg0.conf')
+                        if info.file_size > 2 * 1024 * 1024:
+                            raise ValueError()
+                        table_info = zipped.getinfo('server/clientsTable')
+                        if table_info.file_size > 2 * 1024 * 1024:
+                            raise ValueError()
+                        archived_table = parse_table(zipped.read(table_info).decode())
+                        recovered = parse_config(zipped.read(info).decode(), {
+                            entry['clientId']: entry['userData'].get('clientName', '')
+                            for entry in archived_table
+                        })
+                except (zipfile.BadZipFile, KeyError, RuntimeError, ValueError, OSError):
+                    raise ManagerError('Архив не содержит читаемого конфига VPN.') from None
+                snapshot = self._read(sid)
+                if any(recovered.interface.get(key) != snapshot.config.interface.get(key)
+                       for key in ('PrivateKey', 'Address')):
+                    raise ManagerError('Архив создан для другого интерфейса или ключа сервера.')
+                existing = {peer.public_key for peer in snapshot.config.peers} | self.paused(sid).keys() | snapshot.runtime_peers.keys()
+                reserved = [peer.allowed_ips for peer in snapshot.config.peers]
+                reserved += [item['ips'] for item in self.paused(sid).values()]
+                reserved += [item['runtime_ips'] for item in snapshot.runtime_peers.values() if item.get('runtime_ips')]
+                reserved.extend(str(ip_interface(ip.strip()).ip) for ip in snapshot.config.interface['Address'].split(','))
+                occupied = [ip_network(ip.strip(), strict=False) for ips in reserved
+                            for ip in ips.split(',') if ip.strip()]
+                added = []
+                conflicts = []
+                for peer in recovered.peers:
+                    validate_key(peer.public_key)
+                    if peer.public_key in existing:
+                        continue
+                    settings = fields(peer.block)
+                    if set(settings) - {'PublicKey', 'PresharedKey', 'AllowedIPs', 'Endpoint', 'PersistentKeepalive'}:
+                        raise ManagerError('В архиве есть неподдерживаемые параметры клиента.')
+                    if settings.get('PresharedKey'):
+                        validate_key(settings['PresharedKey'])
+                    try:
+                        addresses = [ip_network(ip.strip(), strict=False) for ip in peer.allowed_ips.split(',')]
+                    except ValueError:
+                        raise ManagerError('В архиве указан неверный адрес клиента.') from None
+                    if any(address.overlaps(used) for address in addresses for used in occupied):
+                        conflicts.append(peer.name)
+                        continue
+                    occupied.extend(addresses)
+                    name = ' '.join(peer.name.splitlines())[:64] or 'Без имени'
+                    clean_block = f'[Peer]\n# {name}\n' + '\n'.join(f'{key} = {value}' for key, value in settings.items())
+                    added.append(Peer(peer.public_key, name, peer.allowed_ips, clean_block))
+                revision = hashlib.sha256((snapshot.text + '\0' + snapshot.table_text +
+                                           json.dumps(self.paused(sid), sort_keys=True) +
+                                           json.dumps({key: item.get('runtime_ips') for key, item in snapshot.runtime_peers.items()}, sort_keys=True)).encode()).hexdigest()
+                result = {'add': [peer.name for peer in added], 'conflicts': conflicts, 'revision': revision}
+                if expected is None:
+                    return result
+                if revision != expected:
+                    raise ManagerError('Конфигурация изменилась. Откройте предпросмотр заново.')
+                if not added:
+                    raise ManagerError('В архиве нет клиентов, которых можно восстановить.')
+                restored_keys = {peer.public_key for peer in added}
+                table = [entry for entry in snapshot.table if entry['clientId'] not in restored_keys]
+                table.extend({'clientId': peer.public_key, 'userData': {'clientName': peer.name}} for peer in added)
+                try:
+                    write_peer(self.runner(sid), before=snapshot.text,
+                               after=snapshot.config.render(snapshot.config.peers + added),
+                               table_before=snapshot.table_text, table_after=json.dumps(table, ensure_ascii=False),
+                               interface=Path(self.store.server(sid).config_path).stem,
+                               key=added[0].public_key, allowed_ips='', psk='',
+                               old_peer='\n\n'.join(peer.block for peer in added),
+                               add_peers=[peer.public_key for peer in added])
+                finally:
+                    self.cache.pop(sid, None)
+                self._read(sid)
+                return result
+            return await self.worker(operation)
 
     @audited('backup.create')
     async def backup(self, sid: int) -> bytes:

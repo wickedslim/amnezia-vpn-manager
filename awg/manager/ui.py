@@ -159,13 +159,16 @@ class UI:
         if message.text.split()[0].split("@", 1)[0] in {"/cancel", "/servers"}:
             self.store.clear_wizard(self.admin_id)
         wizard = self.store.wizard(self.admin_id)
+        if wizard and 'sid' in wizard and not self.access.permits(self.admin_id, wizard['sid']):
+            self.store.clear_wizard(self.admin_id)
+            wizard = None
         if wizard:
             await self.show_wizard(wizard)
         else:
             await self.home(self.revision)
 
     async def home(self, revision=None, force=False, page=0):
-        servers = self.store.servers()
+        servers = [s for s in self.store.servers() if self.access.permits(self.admin_id, s.id)]
         if not servers:
             await self.panel("<b>Amnezia · Панель управления</b>\n\nПодключите первый VPN-сервер.\nОдин бот может управлять несколькими серверами по SSH.", keyboard([("＋ Подключить сервер", "newserver")], [("Как это работает", "help")]), revision)
             return
@@ -257,7 +260,12 @@ class UI:
         server = self.store.server(sid)
         await self.service.snapshot(sid, force)
         client = self.store.client(sid, cid)
-        await self.panel(client_text(server.name, client), keyboard([("Получить конфигурацию", f"conf:{sid}:{cid}")], [("Перевыпустить конфиг", f"reissue:{sid}:{cid}")], [("↻ Обновить", f"cr:{sid}:{cid}"), ("Лимиты и срок", f"policy:{sid}:{cid}")], [("IP подключения", f"ip:{sid}:{cid}"), ("Удалить", f"delete:{sid}:{cid}")], [("‹ Клиенты", f"list:{sid}:0"), ("⌂ Главная", "home")]), revision)
+        paused = client['public_key'] in self.store.get_pref(f'paused_clients:{sid}', {})
+        pause_button = []
+        if self.access.permits(self.admin_id, sid, 'pause'):
+            pause_button = [("Возобновить доступ" if paused else "Приостановить доступ",
+                             f"{'resume' if paused else 'pause'}:{sid}:{cid}")]
+        await self.panel(client_text(server.name, client) + ("\n\n⏸ Доступ приостановлен" if paused else ""), keyboard(pause_button, [("Получить конфигурацию", f"conf:{sid}:{cid}")], [("Перевыпустить конфиг", f"reissue:{sid}:{cid}")], [("↻ Обновить", f"cr:{sid}:{cid}"), ("Лимиты и срок", f"policy:{sid}:{cid}")], [("IP подключения", f"ip:{sid}:{cid}"), ("Удалить", f"delete:{sid}:{cid}")], [("‹ Клиенты", f"list:{sid}:0"), ("⌂ Главная", "home")]), revision)
 
     async def callback(self, call: CallbackQuery):
         self.revision += 1
@@ -266,6 +274,12 @@ class UI:
         action = parts[0]
         try:
             if action in {"newserver","editserver","settings","unlink","unlinkyes","backup"}:self.access.require_owner(self.admin_id)
+            if action in {"s","sr","list","lr","c","cr","months","report","csv","newclient",
+                          "policy","search","reissue","reissueyes","delete","deleteyes","conf","ip","pause","resume"}:
+                operation = {"reissue":"reissue","reissueyes":"reissue","delete":"delete","deleteyes":"delete",
+                             "pause":"pause","resume":"pause","policy":"delete"}.get(action)
+                if not self.access.permits(self.admin_id, int(parts[1]), operation):
+                    raise ManagerError("Недостаточно прав для этого действия.")
             if action == "w":
                 async with self.wizard_lock:
                     await self.wizard_action(parts)
@@ -332,6 +346,10 @@ class UI:
                 sid, cid = map(int, parts[1:3])
                 await self.service.delete_client(sid, cid)
                 await self.clients(sid, revision=revision)
+            elif action in {"pause", "resume"}:
+                sid, cid = map(int, parts[1:3])
+                await self.service.set_paused(sid, cid, action == "pause")
+                await self.client(sid, cid, revision=revision)
             elif action == "conf":
                 sid, cid = map(int, parts[1:3])
                 await self.service.snapshot(sid)
@@ -456,6 +474,8 @@ class UI:
 
     async def wizard_action(self, parts):
         w = self.store.wizard(self.admin_id)
+        if w and 'sid' in w and not self.access.permits(self.admin_id, w['sid'], 'delete' if w['kind']=='policy' else None):
+            raise ManagerError('Доступ к серверу отозван.')
         if len(parts) != 3 or not w or w["nonce"] != parts[1]:
             raise ManagerError("Этот шаг уже закрыт. Начните добавление заново.")
         action = parts[2]
@@ -505,6 +525,10 @@ class UI:
             w = self.store.wizard(self.admin_id)
             if not w:
                 await message.answer("Используйте кнопки меню. /servers — открыть серверы; /start — продолжить настройку.")
+                return
+            if 'sid' in w and not self.access.permits(self.admin_id, w['sid'], 'delete' if w['kind']=='policy' else None):
+                self.store.clear_wizard(self.admin_id)
+                await message.answer('Доступ к серверу отозван.')
                 return
             if not message.text:
                 await message.answer("На этом шаге нужен текст. /cancel — отменить ввод.")
@@ -586,6 +610,8 @@ class UI:
                     await self.server(server.id, revision)
             else:
                 sid = w["sid"]
+                if not self.access.permits(self.admin_id, sid, 'delete' if w['kind']=='policy' else None):
+                    raise ManagerError('Недостаточно прав для этого действия.')
                 if w["kind"] == "client":
                     client = await self.service.create_client(sid, w["name"], w.get("duration"), w.get("limit"))
                     cid = client["id"]
