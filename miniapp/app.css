@@ -195,6 +195,7 @@ dialog .filter-options{position:relative;inset:auto;margin-top:6px;max-height:20
 
 .client-actions{display:grid;gap:var(--space-3)}
 .chart-card+.traffic-comparison{margin-block-start:var(--section-gap)}
+.traffic-comparison>.toolbar{margin-block-start:var(--space-2)}
 .service-traffic-entry{margin-block:var(--section-gap)}
 dialog:has(> .service-traffic-view){padding-inline:var(--space-4);scrollbar-gutter:auto}
 .service-traffic-view{display:flex;flex-direction:column;gap:var(--space-2);block-size:min(36rem,calc(100dvh - 32px - var(--space-6) - var(--space-6)))}
