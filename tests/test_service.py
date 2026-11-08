@@ -1,10 +1,11 @@
 import asyncio
+import base64
 import json
 import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from manager.domain import ManagerError, Server, parse_config
 from manager.service import VPNService
@@ -53,6 +54,51 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                 "systemctl --no-ask-password enable --now amnezia-service-traffic.service",
                 "systemctl --no-ask-password disable --now amnezia-service-traffic.service",
             ])
+
+    async def test_traffic_install_transfers_bundled_scripts_and_does_not_start_service(self):
+        sid = self.server.id
+        existing = self.service.runner(sid)
+        install_runner = Mock()
+        install_runner.run.side_effect = [ManagerError("network"), "", (
+            "LoadState=loaded\nUnitFileState=disabled\nActiveState=inactive\n"
+            "ExecStart={ argv[]=/opt/amnezia-service-traffic/venv/bin/python "
+            "/opt/amnezia-service-traffic/collector.py collect amnezia-awg wg0 ; }"
+        )]
+        with patch.object(existing, "run", create=True, return_value="LoadState=not-found"):
+            self.service.runner_factory = Mock(return_value=install_runner)
+            self.assertEqual(await self.service.start_service_traffic_install(sid), {"state": "installing"})
+            job = self.service.traffic_installs[sid]
+            self.assertEqual(await self.service.start_service_traffic_install(sid), {"state": "installing"})
+            self.assertIs(self.service.traffic_installs[sid], job)
+            await job
+            self.assertIn("error", await self.service.service_traffic_control(sid))
+            await self.service.start_service_traffic_install(sid)
+            await self.service.traffic_installs[sid]
+            self.assertNotIn("error", await self.service.service_traffic_control(sid))
+            command, payload = install_runner.run.call_args_list[1].args
+            self.assertTrue(command.endswith("install-traffic amnezia-awg wg0"))
+            for name, line in zip(("install-service-traffic.sh", "service_traffic.py"), payload.splitlines(), strict=True):
+                source = Path(__file__).resolve().parents[1] / "scripts" / name
+                self.assertEqual(base64.b64decode(line), source.read_bytes())
+            self.assertTrue(all("--now" not in call.args[0] for call in install_runner.run.call_args_list))
+
+    async def test_traffic_install_can_enable_collection_after_installation(self):
+        sid = self.server.id
+        existing = self.service.runner(sid)
+        runner = Mock()
+        disabled = ("LoadState=loaded\nUnitFileState=disabled\nActiveState=inactive\n"
+                    "ExecStart={ argv[]=/opt/amnezia-service-traffic/venv/bin/python "
+                    "/opt/amnezia-service-traffic/collector.py collect amnezia-awg wg0 ; }")
+        enabled = disabled.replace("=disabled", "=enabled").replace("=inactive", "=active")
+        runner.run.side_effect = ["", disabled, "", "", enabled]
+        self.service.runner_factory = Mock(return_value=runner)
+        with patch.object(existing, "run", create=True, return_value="LoadState=not-found"):
+            await self.service.start_service_traffic_install(sid, enable=True)
+            await self.service.traffic_installs[sid]
+        operations = [call.args[0] for call in runner.run.call_args_list]
+        self.assertIn('install-service-traffic.sh', operations[0])
+        self.assertEqual(operations[3], "systemctl --no-ask-password enable --now amnezia-service-traffic.service")
+        self.assertNotIn(sid, self.service.traffic_install_errors)
 
     async def test_snapshot_handles_adjacent_peers_and_duplicate_names(self):
         snapshot = await self.service.snapshot(self.server.id)
