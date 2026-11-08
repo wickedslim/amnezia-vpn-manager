@@ -4,6 +4,7 @@ import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from manager.domain import ManagerError, Server, parse_config
 from manager.service import VPNService
@@ -26,6 +27,32 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.service.close()
         self.store.close()
         self.tmp.cleanup()
+
+    async def test_traffic_control_switches_only_the_matching_collector(self):
+        sid = self.server.id
+        prefix = "/opt/amnezia-service-traffic"
+        command = f"{prefix}/venv/bin/python {prefix}/collector.py collect amnezia-awg wg0"
+        def output(mode, active, args=command):
+            return (f"LoadState=loaded\nActiveState={active}\nUnitFileState={mode}\n"
+                    f"ExecStart={{ path={prefix}/venv/bin/python ; argv[]={args} ; ignore_errors=no }}")
+        with patch.object(self.service.runner(sid), "run", create=True, side_effect=[
+            output("disabled", "inactive"), "", "", output("enabled", "active"),
+            output("enabled", "active"), "", output("disabled", "inactive"),
+            output("enabled", "active", command.replace("wg0", "wg1")),
+            output("enabled", "active", command.replace("wg0", "wg1")),
+        ]) as run:
+            self.assertEqual(await self.service.service_traffic_control(sid, True),
+                             {"state": "ready", "enabled": True, "running": True})
+            self.assertEqual(await self.service.service_traffic_control(sid, False),
+                             {"state": "ready", "enabled": False, "running": False})
+            self.assertEqual(await self.service.service_traffic_control(sid), {"state": "unmanaged"})
+            with self.assertRaises(ManagerError):
+                await self.service.service_traffic_control(sid, False)
+            operations = [call.args[0] for call in run.call_args_list if " --now " in call.args[0]]
+            self.assertEqual(operations, [
+                "systemctl --no-ask-password enable --now amnezia-service-traffic.service",
+                "systemctl --no-ask-password disable --now amnezia-service-traffic.service",
+            ])
 
     async def test_snapshot_handles_adjacent_peers_and_duplicate_names(self):
         snapshot = await self.service.snapshot(self.server.id)
@@ -116,6 +143,35 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             self.assertIn("manager.sqlite3",archive.namelist())
             self.assertIn("server/wg0.conf",archive.namelist())
+
+    async def test_pause_reserves_address_and_resumes_same_client_after_restart(self):
+        sid = self.server.id
+        client = await self.service.create_client(sid, 'phone', None, None)
+        await self.service.set_paused(sid, client['id'], True)
+        self.assertNotIn(client['public_key'], json.loads((self.vpn / 'runtime.json').read_text())['peers'])
+        self.assertNotIn(client['public_key'], (self.vpn / 'wg0.conf').read_text())
+        await self.service.close()
+        self.service = VPNService(self.store, FakeRunner)
+        self.assertEqual(self.store.client(sid, client['id'])['config'], client['config'])
+        other = await self.service.create_client(sid, 'tablet', None, None)
+        self.assertNotEqual(other['allowed_ips'], client['allowed_ips'])
+        await self.service.set_paused(sid, client['id'], False)
+        self.assertEqual(self.store.client(sid, client['id'])['config'], client['config'])
+        self.assertIn(client['public_key'], json.loads((self.vpn / 'runtime.json').read_text())['peers'])
+
+    async def test_restore_preview_checks_revision_and_restores_only_missing_client(self):
+        sid = self.server.id
+        client = await self.service.create_client(sid, 'phone', None, None)
+        archive = await self.service.backup(sid)
+        await self.service.delete_client(sid, client['id'])
+        preview = await self.service.restore_backup(sid, archive)
+        self.assertEqual(preview['add'], ['phone'])
+        self.assertEqual(len(self.store.clients(sid)), 2)
+        with self.assertRaisesRegex(ManagerError, 'изменилась'):
+            await self.service.restore_backup(sid, archive, 'wrong-revision')
+        await self.service.restore_backup(sid, archive, preview['revision'])
+        self.assertEqual(len(self.store.clients(sid)), 3)
+        self.assertEqual(self.store.client(sid, client['id'])['config'], client['config'])
 
     async def test_bad_client_table_blocks_mutation(self):
         (self.vpn / "clientsTable").write_text("{broken")
