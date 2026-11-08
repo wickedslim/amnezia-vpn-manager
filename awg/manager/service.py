@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import hashlib
 import json
 import logging
+import os
 import re
 import tempfile
 import time
@@ -23,6 +25,17 @@ TRAFFIC_COLLECTOR = "/opt/amnezia-service-traffic/collector.py"
 TRAFFIC_PYTHON = "/opt/amnezia-service-traffic/venv/bin/python"
 TRAFFIC_UNIT = "amnezia-service-traffic.service"
 TRAFFIC_RUNNING = {"active", "activating", "deactivating", "reloading"}
+TRAFFIC_SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
+TRAFFIC_INSTALL_COMMAND = """set -eu
+umask 077
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+for name in install-service-traffic.sh service_traffic.py; do
+    IFS= read -r payload
+    printf '%s' "$payload" | base64 -d > "$work/$name"
+done
+timeout --kill-after=5s 180s bash "$work/install-service-traffic.sh" "$@"
+"""
 
 
 def parse_table(text: str) -> list[dict]:
@@ -54,6 +67,8 @@ class VPNService:
         self.locks: dict[int, asyncio.Lock] = {}
         self.cache: dict[int, Snapshot] = {}
         self.capacity = asyncio.Semaphore(4)
+        self.traffic_installs: dict[int, asyncio.Task] = {}
+        self.traffic_install_errors: dict[int, str] = {}
 
     def lock(self, sid: int):
         return self.locks.setdefault(sid, asyncio.Lock())
@@ -88,24 +103,104 @@ class VPNService:
 
     def _service_traffic_status(self, server: Server, runner: Runner) -> dict:
         output = runner.run(
-            f"if [ -f {TRAFFIC_COLLECTOR} ]; then systemctl show "
-            f"-p LoadState -p ExecStart -p ActiveState -p UnitFileState {TRAFFIC_UNIT}; fi",
+            f"state=$(systemctl show -p LoadState {TRAFFIC_UNIT}) || "
+            f'[ "$state" = LoadState=not-found ] || exit 1; '
+            f'if [ "$state" = LoadState=loaded ] && [ -f {TRAFFIC_COLLECTOR} ]; then '
+            f"systemctl show -p LoadState -p ExecStart -p ActiveState -p UnitFileState {TRAFFIC_UNIT}; "
+            f'else printf "%s\\n" "$state"; fi',
             timeout=5,
         )
         props = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
         load = props.get("LoadState")
         if not output or load == "not-found":
-            return {"state": "missing"}
+            return {"state": "missing"} if self._can_install_traffic(server) else {"state": "requires_root"}
         expected = f"{TRAFFIC_PYTHON} {TRAFFIC_COLLECTOR} collect {server.container} {Path(server.config_path).stem}"
         commands = re.findall(r"argv\[\]=(.*?) ;", props.get("ExecStart", ""))
         if load != "loaded" or commands != [expected]:
             return {"state": "unmanaged"}
         activity = props.get("ActiveState")
         mode = props.get("UnitFileState")
-        if (not server.local and server.username != "root") or mode not in {"enabled", "disabled", "enabled-runtime"}:
+        if not self._can_install_traffic(server) or mode not in {"enabled", "disabled", "enabled-runtime"}:
             return {"state": "unmanaged"}
         return {"state": "ready", "enabled": mode.startswith("enabled") or activity in TRAFFIC_RUNNING,
                 "running": activity in {"active", "reloading"}}
+
+    @staticmethod
+    def _can_install_traffic(server: Server) -> bool:
+        return os.geteuid() == 0 if server.local else server.username == "root"
+
+    async def start_service_traffic_install(self, sid: int, *, enable: bool = False) -> dict:
+        server = self.store.server(sid)
+        if not self._can_install_traffic(server):
+            raise ManagerError("Для установки сборщика нужен root на выбранном VPS.")
+        async with self.lock(sid):
+            if sid in self.traffic_installs:
+                return {"state": "installing"}
+            def prepare():
+                runner = self.runner(sid)
+                status = self._service_traffic_status(server, runner)
+                if enable and status["state"] == "ready" and not status["running"]:
+                    return self._set_service_traffic(server, runner, True)
+                return status
+
+            self.traffic_install_errors.pop(sid, None)
+            status = await self.worker(prepare)
+            if status["state"] == "ready":
+                return status
+            if status["state"] != "missing":
+                raise ManagerError("На VPS уже есть служба сборщика. Проверьте, к какому интерфейсу она привязана.")
+            try:
+                payload = b"".join(
+                    base64.b64encode((TRAFFIC_SCRIPTS / name).read_bytes()) + b"\n"
+                    for name in ("install-service-traffic.sh", "service_traffic.py")
+                )
+            except OSError as exc:
+                raise ManagerError("В установке менеджера нет файлов сборщика. Обновите менеджер и повторите.") from exc
+            self.traffic_installs[sid] = asyncio.create_task(self._install_service_traffic(server, payload, enable))
+            return {"state": "installing"}
+
+    async def _install_service_traffic(self, server: Server, payload: bytes, enable: bool) -> None:
+        sid = server.id
+
+        def install():
+            # Package download uses its own SSH connection so VPN polling can continue.
+            runner = self.runner_factory(server, self.store.directory)
+            try:
+                args = [TRAFFIC_INSTALL_COMMAND, "install-traffic", server.container, Path(server.config_path).stem]
+                runner.run("sh -c " + " ".join(map(q, args)), payload, timeout=195)
+                status = self._service_traffic_status(server, runner)
+                if status["state"] != "ready":
+                    raise ManagerError("Служба сборщика не появилась после установки.")
+                if enable:
+                    try:
+                        self._set_service_traffic(server, runner, True)
+                    except ManagerError:
+                        return "nDPI установлен, но сбор не запустился. Проверьте службу сборщика."
+            finally:
+                runner.close()
+
+        try:
+            error = await self.worker(install)
+            if error:
+                self.traffic_install_errors[sid] = error
+        except Exception as exc:
+            log.warning("Traffic collector install failed for server %s: %s", sid, type(exc).__name__)
+            self.traffic_install_errors[sid] = (
+                "Не удалось установить сборщик. Проверьте контейнер и VPN-интерфейс, "
+                "Python с venv и доступ VPS к PyPI."
+            )
+        finally:
+            self.traffic_installs.pop(sid, None)
+
+    def _set_service_traffic(self, server: Server, runner: Runner, enabled: bool) -> dict:
+        if enabled:
+            runner.run("systemctl is-active --quiet docker.service", timeout=5)
+        action = "enable" if enabled else "disable"
+        runner.run(f"systemctl --no-ask-password {action} --now {TRAFFIC_UNIT}", timeout=15)
+        result = self._service_traffic_status(server, runner)
+        if result.get("enabled") != enabled or (enabled and not result.get("running")):
+            raise ManagerError("Сборщик не перешёл в нужное состояние. Проверьте статус службы.")
+        return result
 
     async def service_traffic_control(self, sid: int, enabled: bool | None = None) -> dict:
         server = self.store.server(sid)
@@ -114,19 +209,20 @@ class VPNService:
             runner = self.runner(sid)
             status = self._service_traffic_status(server, runner)
             if enabled is None:
+                if sid in self.traffic_install_errors:
+                    status["error"] = self.traffic_install_errors[sid]
                 return status
             if status["state"] != "ready":
                 raise ManagerError("Управление этим сборщиком недоступно.")
-            if enabled:
-                runner.run("systemctl is-active --quiet docker.service", timeout=5)
-            action = "enable" if enabled else "disable"
-            runner.run(f"systemctl --no-ask-password {action} --now {TRAFFIC_UNIT}", timeout=15)
-            result = self._service_traffic_status(server, runner)
-            if result.get("enabled") != enabled or (enabled and not result.get("running")):
-                raise ManagerError("Сборщик не перешёл в нужное состояние. Проверьте статус службы.")
+            result = self._set_service_traffic(server, runner, enabled)
+            self.traffic_install_errors.pop(sid, None)
             return result
 
         async with self.lock(sid):
+            if sid in self.traffic_installs:
+                if enabled is not None:
+                    raise ManagerError("Дождитесь завершения установки сборщика.")
+                return {"state": "installing"}
             return await self.worker(control)
 
     def _read(self, sid: int) -> Snapshot:
@@ -518,6 +614,7 @@ printf '%s\\n' "$private" | "$WG" pubkey
             return await self.worker(operation)
 
     async def close(self):
+        await asyncio.gather(*self.traffic_installs.values())
         for sid in list(self.runners):
             async with self.lock(sid):
                 await self.worker(self.runners[sid].close)
