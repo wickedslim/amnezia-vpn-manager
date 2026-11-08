@@ -121,6 +121,8 @@ chmod 600 "$BACKUP/installation.tar.gz"
 READY=true
 # Runtime data in awg/files and awg/users are deliberately excluded from the release.
 tar --exclude='*/__pycache__' -C "$SOURCE" -cf - awg/manager awg/bot_manager.py miniapp requirements.txt LICENSE VERSION | tar -C "$TARGET" -xf -
+install -d -m 755 "$TARGET/scripts"
+install -m 644 "$SOURCE/scripts/install-service-traffic.sh" "$SOURCE/scripts/service_traffic.py" "$TARGET/scripts/"
 install -d -m 700 -o "$SERVICE_USER" "$TARGET/awg/files"
 if [[ ! -f "$TARGET/awg/files/setting.ini" ]]; then
     "$VENV/bin/python" "$TARGET/awg/bot_manager.py" --init

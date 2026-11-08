@@ -215,6 +215,11 @@ section.service-traffic-row,.traffic-service-details{padding-inline-end:var(--tr
 .service-traffic-controls{margin-block:var(--space-4)}
 .service-traffic-controls .motion-row{gap:var(--space-3)}
 .service-traffic-controls .motion-row span{min-width:0;overflow-wrap:anywhere}
+.service-traffic-controls .service-traffic-status[data-state=ready]{color:var(--green)}
+.service-traffic-controls .service-traffic-status:is([data-state=missing],[data-state=requires_root],[data-state=stopped]){color:var(--tg-theme-destructive-text-color)}
+.service-traffic-controls .service-traffic-detail:not([hidden])::before{content:" · ";white-space:pre}
+.service-traffic-controls .service-traffic-error[hidden]{display:none}
+.dialog-title:focus:not(:focus-visible){outline:none}
 .service-traffic-row summary{display:grid;grid-template-columns:minmax(0,1fr) var(--traffic-chevron-space);align-items:start;min-height:44px;cursor:pointer;list-style:none}
 .service-traffic-row summary::-webkit-details-marker{display:none}
 .traffic-group-chevron{display:flex;justify-content:flex-end;padding-block-start:6px;color:var(--tg-theme-hint-color)}

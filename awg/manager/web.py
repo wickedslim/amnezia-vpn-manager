@@ -465,6 +465,12 @@ class MiniApp:
         self.require_owner(request["uid"])
         sid = int(request.match_info["sid"])
         self.store.server(sid)
+        if request.method == "POST":
+            body = await request.json() if request.can_read_body else {}
+            if not isinstance(body, dict) or type(body.get("enable", False)) is not bool:
+                raise ValueError
+            result = await self.service.start_service_traffic_install(sid, enable=body.get("enable", False))
+            return web.json_response(result, status=202 if result["state"] == "installing" else 200)
         if request.method == "PATCH":
             body = await request.json()
             if not isinstance(body, dict) or type(body.get("enabled")) is not bool:
@@ -677,6 +683,7 @@ def create_web_app(settings, store, service, bot=None):
     app.router.add_post(r'/api/servers/{sid:\d+}/diagnostics', api.diagnostics)
     app.router.add_patch(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/labels', api.client_labels)
     app.router.add_get(r'/api/servers/{sid:\d+}/service-traffic/control', api.service_traffic_control)
+    app.router.add_post(r'/api/servers/{sid:\d+}/service-traffic/control', api.service_traffic_control)
     app.router.add_patch(r'/api/servers/{sid:\d+}/service-traffic/control', api.service_traffic_control)
     app.router.add_get(r'/api/servers/{sid:\d+}/service-traffic', api.service_traffic)
     app.router.add_get(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/service-traffic', api.service_traffic)

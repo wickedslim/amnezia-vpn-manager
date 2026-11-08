@@ -93,8 +93,8 @@ function openServiceTrafficSettings(){
   const d=$('#modal');
   delete d.dataset.updateProgress;
   d.setAttribute('aria-label','Трафик по сервисам');
-  d.innerHTML=`<h2 class="dialog-title">Трафик по сервисам</h2>
-    <p class="footnote">Включайте сбор отдельно на каждом VPS. При выключении сборщик останавливается, а накопленная статистика остаётся доступной. VPN продолжает работать.</p>
+  d.innerHTML=`<h2 class="dialog-title" tabindex="-1" autofocus>Трафик по сервисам</h2>
+    <p class="footnote">Включите сбор на нужном VPS. При первом включении nDPI установится автоматически. Сбор повышает нагрузку на процессор и расход памяти. При выключении статистика сохраняется.</p>
     <div class="service-traffic-controls"></div>
     <button type="button" class="secondary full" data-action="close">Закрыть</button>`;
   const list=d.querySelector('.service-traffic-controls');
@@ -103,20 +103,37 @@ function openServiceTrafficSettings(){
   d.showModal();
   for(const host of hosts){
     const row=document.createElement('div');
-    row.innerHTML=`<label class="motion-row"><span><b>${esc(host.name)}</b><small role="status">Проверяю состояние…</small></span>
+    row.innerHTML=`<label class="motion-row"><span><b>${esc(host.name)}</b>
+      <small role="status"><span class="service-traffic-status">Проверяю состояние…</span><span class="service-traffic-detail" hidden></span></small>
+      <small class="service-traffic-error" hidden></small></span>
       <input type="checkbox" role="switch" aria-label="Сбор трафика — ${esc(host.name)}" disabled></label>`;
     list.append(row);
-    const toggle=row.querySelector('input'), message=row.querySelector('small');
+    const toggle=row.querySelector('input'), message=row.querySelector('.service-traffic-status');
+    const detail=row.querySelector('.service-traffic-detail');
+    const errorMessage=row.querySelector('.service-traffic-error');
     const path=`/servers/${host.id}/service-traffic/control`;
-    const describe=status=>{
+    let current;
+    const describe=(status,poll=true)=>{
+      current=status.state;
       toggle.checked=status.enabled===true;
-      toggle.disabled=status.state!=='ready';
+      toggle.disabled=!['ready','missing'].includes(current);
+      message.dataset.state=current==='ready'&&!status.running?'stopped':current;
       message.textContent={
-        ready:status.running?'Сбор включён':status.enabled?'Автозапуск включён, служба сейчас не работает':'Сбор выключен',
-        missing:'Сборщик не установлен',
+        ready:status.running?'nDPI установлен':'nDPI остановлен',
+        missing:'nDPI не установлен',
+        installing:'Устанавливаю nDPI…',
+        requires_root:'nDPI не установлен',
         unmanaged:'Служба не привязана к этому интерфейсу или недоступна для управления',
         unavailable:'Не удалось проверить состояние службы'
-      }[status.state];
+      }[current];
+      detail.textContent=current==='ready'?(status.running?'Сбор включён':status.enabled?'Автозапуск включён':''):'';
+      detail.hidden=!detail.textContent;
+      errorMessage.textContent=status.error||(current==='requires_root'?'Для установки из панели нужен root на VPS':'');
+      errorMessage.hidden=!errorMessage.textContent;
+      if(status.error&&d.open&&row.isConnected)toast(status.error);
+      if(poll&&status.state==='installing'){
+        setTimeout(()=>{if(d.open&&row.isConnected)read()},2000);
+      }
     };
     const read=async()=>{
       try{describe(await api(path))}
@@ -124,10 +141,15 @@ function openServiceTrafficSettings(){
     };
     toggle.addEventListener('change',async()=>{
       const enabled=toggle.checked;
+      const needsInstall=current==='missing'&&enabled;
       toggle.disabled=true;
-      message.textContent=enabled?'Запускаю сборщик…':'Останавливаю сборщик…';
+      if(needsInstall)describe({state:'installing'},false);
+      else detail.textContent=enabled?'Запускаю сборщик…':'Останавливаю сборщик…';
       try{
-        describe(await api(path,{method:'PATCH',body:JSON.stringify({enabled})},40000));
+        const options=needsInstall
+          ? {method:'POST',body:JSON.stringify({enable:true})}
+          : {method:'PATCH',body:JSON.stringify({enabled})};
+        describe(await api(path,options,40000));
       }catch(error){
         await read();
         if(d.open&&row.isConnected)toast(error.message);

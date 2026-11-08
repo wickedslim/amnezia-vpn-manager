@@ -72,12 +72,22 @@ test('traffic settings toggle each installed collector independently', async ({p
   const installed = dialog.getByRole('switch').first();
   const missing = dialog.getByRole('switch').nth(1);
   await expect(installed).toBeChecked();
-  await expect(missing).toBeDisabled();
-  await expect(dialog.getByText('Сборщик не установлен')).toBeVisible();
+  await expect(missing).toBeEnabled();
+  await expect(dialog.getByText('nDPI не установлен',{exact:true})).toBeVisible();
+  await expect(dialog.getByText('nDPI установлен',{exact:true})).toBeVisible();
   await installed.click();
-  await expect(dialog.getByText('Сбор выключен')).toBeVisible();
+  await expect(dialog.getByText('nDPI остановлен',{exact:true})).toHaveAttribute('data-state','stopped');
   await expect(installed).not.toBeChecked();
   await installed.click();
   await expect(dialog.getByText('Сбор включён')).toBeVisible();
+  await expect(installed).toBeChecked();
+
+  const request = page.waitForRequest(req =>
+    req.method() === 'POST' && req.url().endsWith('/servers/2/service-traffic/control'));
+  await missing.click();
+  expect((await request).postDataJSON()).toEqual({enable:true});
+  await expect(dialog.getByText('nDPI установлен',{exact:true})).toHaveCount(2);
+  await expect(missing).toBeEnabled();
+  await expect(missing).toBeChecked();
   await expect(installed).toBeChecked();
 });
