@@ -13,7 +13,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from manager.domain import Peer, Server
 from manager.store import Store
-from manager.web import create_web_app, validate_init_data
+from manager.web import MiniApp, create_web_app, validate_init_data
 
 
 def signed(token='test-token',uid=123,age=0,extra=None):
@@ -42,6 +42,38 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         await self.client.start_server();self.headers={'Authorization':'tma '+signed()}
     async def asyncTearDown(self):
         await self.client.close();self.store.close();self.tmp.cleanup()
+    async def test_service_traffic_control_is_owner_only_and_validates_boolean(self):
+        self.store.set_pref("telegram_admins", [{"id": 124, "name": "admin"}])
+        sid = self.server.id
+        url = f"/api/servers/{sid}/service-traffic/control"
+        status = {"state": "ready", "enabled": False, "running": False}
+        self.service.service_traffic_control = AsyncMock(return_value=status)
+        admin = {"Authorization": "tma " + signed(uid=124)}
+        response = await self.client.get(url, headers=admin)
+        self.assertEqual(response.status, 403)
+        response = await self.client.patch(url, headers=admin, json={"enabled": False})
+        self.assertEqual(response.status, 403)
+        response = await self.client.patch(url, headers=self.headers, json={"enabled": "false"})
+        self.assertEqual(response.status, 400)
+        self.service.service_traffic_control.assert_not_awaited()
+        response = await self.client.patch(url, headers=self.headers, json={"enabled": False})
+        self.assertEqual(await response.json(), status)
+        self.service.service_traffic_control.assert_awaited_once_with(sid, False)
+
+    async def test_service_traffic_requires_owner_and_scopes_client(self):
+        self.store.set_pref('telegram_admins', [{'id': 124, 'name': 'admin'}])
+        cid = self.store.clients(self.server.id)[0]['id']
+        url = f'/api/servers/{self.server.id}/clients/{cid}/service-traffic'
+        self.service.service_traffic = AsyncMock(return_value={'state': 'disabled', 'rows': []})
+        response = await self.client.get(url, headers={'Authorization': 'tma '+signed(uid=124)})
+        self.assertEqual(response.status, 403)
+        response = await self.client.get(url+'?window=year', headers=self.headers)
+        self.assertEqual(response.status, 400)
+        self.service.service_traffic.assert_not_awaited()
+        response = await self.client.get(url+'?window=week', headers=self.headers)
+        self.assertEqual(await response.json(), {'state': 'disabled', 'rows': []})
+        self.service.service_traffic.assert_awaited_once_with(self.server.id, 'week', 'public')
+
     async def test_overview_retains_connection_history_without_claiming_online(self):
         stamp = int(time.time()) - 3600
         self.store.sync(self.server.id, [Peer('public','client','10.0.0.2/32','',handshake=stamp)], 'server')
@@ -59,6 +91,73 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         client = (await response.json())['servers'][0]['clients'][0]
         self.assertFalse(client['has_history'])
         self.assertEqual(client['last_handshake'], 0)
+
+    async def test_backup_schedule_sends_once_when_due_and_can_be_disabled(self):
+        path = '/api/backup-schedule'
+        self.store.set_pref('telegram_admins', [{'id': 124, 'name': 'admin'}])
+        data = {'hours': 3, 'server_id': self.server.id}
+        response = await self.client.patch(path, json=data, headers={'Authorization': 'tma '+signed(uid=124)})
+        self.assertEqual(response.status, 403)
+        response = await self.client.patch(path, json={**data, 'hours': 4}, headers=self.headers)
+        self.assertEqual(response.status, 400)
+        response = await self.client.patch(path, json=data, headers=self.headers)
+        self.assertEqual(response.status, 200)
+        schedule = (await response.json())['schedule']
+        self.assertGreater(schedule['next_at'], time.time())
+        self.service.backup = AsyncMock(return_value=b'private archive')
+        worker = MiniApp(SimpleNamespace(admin_id=123), self.store, self.service, self.bot)
+        await worker.run_scheduled_backup()
+        self.bot.send_document.assert_not_awaited()
+        self.store.set_pref('backup_schedule', {**schedule, 'next_at': 0})
+        await worker.run_scheduled_backup()
+        await worker.run_scheduled_backup()
+        self.service.backup.assert_awaited_once_with(self.server.id)
+        self.bot.send_document.assert_awaited_once()
+        self.assertEqual(self.bot.send_document.await_args.args[0], 123)
+        response = await self.client.patch(path, json={'hours': None}, headers=self.headers)
+        result = await response.json()
+        self.assertIsNone(result['schedule'])
+        self.assertEqual(result['history'][0]['status'], 'sent')
+
+    async def test_restore_requires_owner_and_a_single_use_preview(self):
+        self.store.set_pref('telegram_admins', [{'id': 124, 'name': 'admin'}])
+        admin = {'Authorization': 'tma '+signed(uid=124)}
+        self.service.restore_backup = AsyncMock(side_effect=[
+            {'add': ['phone'], 'conflicts': [], 'revision': 'before'},
+            {'add': ['phone'], 'conflicts': []},
+        ])
+        url = f'/api/servers/{self.server.id}/restore'
+        archive = b'fixture archive'
+        self.assertEqual((await self.client.post(url+'/preview', data=archive, headers=admin)).status, 403)
+        response = await self.client.post(url+'/preview', data=archive, headers=self.headers)
+        preview = await response.json()
+        self.assertEqual(preview['add'], ['phone'])
+        self.assertNotIn('revision', preview)
+        confirm = {'token': preview['token']}
+        self.assertEqual((await self.client.post(url, json=confirm, headers=admin)).status, 403)
+        response = await self.client.post(url, json=confirm, headers=self.headers)
+        self.assertEqual(await response.json(), {'restored': 1})
+        self.service.restore_backup.assert_awaited_with(self.server.id, archive, 'before')
+        self.assertEqual((await self.client.post(url, json=confirm, headers=self.headers)).status, 400)
+
+    async def test_resource_alerts_wait_for_cpu_and_deduplicate_until_recovery(self):
+        self.bot.send_message = AsyncMock()
+        worker = MiniApp(SimpleNamespace(admin_id=123), self.store, self.service, self.bot)
+        self.store.set_pref('resource_alerts', {'disk': 90, 'cpu': 80})
+        sample = {'stale': False, 'cpu': 95, 'disk': {'used': 93, 'total': 100}}
+        worker.resources.get = lambda sid: sample
+        await worker.check_resource_alerts()
+        self.assertEqual(self.bot.send_message.await_count, 1)
+        worker.resource_since[f'{self.server.id}:cpu'] -= 181
+        await worker.check_resource_alerts()
+        await worker.check_resource_alerts()
+        self.assertEqual(self.bot.send_message.await_count, 2)
+        sample.update(stale=True)
+        await worker.check_resource_alerts()
+        sample.update(stale=False, cpu=30, disk={'used': 50, 'total': 100})
+        await worker.check_resource_alerts()
+        self.assertEqual(self.bot.send_message.await_count, 4)
+        self.assertEqual(self.store.get_pref('resource_alert_state'), {})
 
     async def test_backup_sends_archive_only_to_owner(self):
         self.service.backup=AsyncMock(return_value=b'private archive')
@@ -190,6 +289,22 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.client.delete('/api/admins/123',headers=self.headers)).status,400)
         self.assertEqual((await self.client.delete('/api/admins/456',headers=self.headers)).status,200)
         self.assertEqual((await self.client.get('/api/overview',headers=admin)).status,401)
+
+    async def test_admin_scope_filters_overview_and_blocks_direct_mutations(self):
+        other = self.store.add_server(Server(0, 'Other', host='other'))
+        await self.client.post('/api/admins', headers=self.headers, json={'id': 456, 'name': 'Друг'})
+        admin = {'Authorization': 'tma ' + signed(uid=456)}
+        scope = {'servers': [self.server.id], 'operations': []}
+        self.assertEqual((await self.client.patch('/api/admins/456', headers=admin, json=scope)).status, 403)
+        self.assertEqual((await self.client.patch('/api/admins/456', headers=self.headers, json=scope)).status, 200)
+        response = await self.client.get('/api/overview', headers=admin)
+        self.assertEqual([s['id'] for s in (await response.json())['servers']], [self.server.id])
+        self.assertEqual((await self.client.get(f'/api/servers/{other.id}/monthly', headers=admin)).status, 403)
+        cid = self.store.clients(self.server.id)[0]['id']
+        base = f'/api/servers/{self.server.id}/clients/{cid}'
+        self.assertEqual((await self.client.delete(base, headers=admin)).status, 403)
+        self.assertEqual((await self.client.patch(base+'/pause', headers=admin, json={'paused': True})).status, 403)
+        self.service.delete_client.assert_not_awaited()
 
     async def test_admin_preferences_and_confirmations_are_isolated(self):
         await self.client.post('/api/admins',headers=self.headers,json={'id':456,'name':'Друг'})

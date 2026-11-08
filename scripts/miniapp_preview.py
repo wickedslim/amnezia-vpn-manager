@@ -65,6 +65,38 @@ def create_demo():
         def lock(self, sid):
             import asyncio
             return asyncio.Lock()
+        traffic_enabled = {1: True}
+
+        async def service_traffic_control(self, sid, enabled=None):
+            if sid not in self.traffic_enabled:
+                return {"state": "missing"}
+            if enabled is not None:
+                self.traffic_enabled[sid] = enabled
+            active = self.traffic_enabled[sid]
+            return {"state": "ready", "enabled": active, "running": active}
+
+        async def service_traffic(self, sid, window, public_key=""):
+            factor = (1 if window == "day" else 7) * (1 if public_key else 4)
+            now = int(time.time())
+            rows = [
+                ("youtube", 178_000_000, 7_000_000),
+                ("telegram", 41_000_000, 18_000_000),
+                ("instagram", 33_000_000, 4_000_000),
+                ("tiktok", 28_000_000, 6_000_000),
+                ("web", 26_000_000, 9_000_000),
+                ("unknown", 18_000_000, 5_000_000),
+                ("whatsapp", 9_000_000, 6_000_000),
+                ("vk", 8_000_000, 2_000_000),
+                ("discord", 3_000_000, 4_000_000),
+                ("spotify", 7_000_000, 400_000),
+                ("group_music", 6_000_000, 200_000),
+                ("steam", 11_000_000, 600_000),
+                ("group_updates", 2_000_000, 100_000),
+            ]
+            return {"state": "active", "started": now - 86400 * 8, "updated": now,
+                    "rows": [{"category": name, "rx": rx * factor, "tx": tx * factor}
+                             for name, rx, tx in rows]}
+
         async def snapshot(self, sid, force=False):
             await self.overview(force)
         async def overview(self, force=False):

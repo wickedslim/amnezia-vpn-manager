@@ -192,3 +192,35 @@ dialog .filter-options{position:relative;inset:auto;margin-top:6px;max-height:20
 .report-error{margin-block:var(--section-gap)}
 .empty a{display:inline-flex;align-items:center;justify-content:center;margin-top:20px}
 @media(max-width:359px){dialog{padding:20px}.hero-footer{gap:12px}.report-title{gap:8px}.header{gap:8px}.header-actions{gap:8px}}
+
+.client-actions{display:grid;gap:var(--space-3)}
+.chart-card+.traffic-comparison{margin-block-start:var(--section-gap)}
+.service-traffic-entry{margin-block:var(--section-gap)}
+dialog:has(> .service-traffic-view){padding-inline:var(--space-4);scrollbar-gutter:auto}
+.service-traffic-view{display:flex;flex-direction:column;gap:var(--space-2);block-size:min(36rem,calc(100dvh - 32px - var(--space-6) - var(--space-6)))}
+.service-traffic-view .dialog-title:focus{outline:none}
+.service-traffic-view .subtitle{margin:0}
+.service-traffic-view>.chips{flex:none}
+.service-traffic-scroll{flex:1;min-block-size:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-gutter:stable both-edges;margin-inline:calc(-1 * var(--space-3));padding-inline:var(--space-3)}
+.service-traffic-view>[data-action=close]{flex:none}
+.service-traffic-report{--traffic-chevron-space:24px;min-height:2.5rem}
+.service-traffic-report .detail-row{min-width:0;gap:12px;padding-block:4px}
+.service-traffic-row{margin-block-start:8px;padding-block-start:6px;border-block-start:1px solid color-mix(in srgb,var(--tg-theme-hint-color) 14%,transparent)}
+.service-traffic-row .detail-row{border:0}
+section.service-traffic-row,.traffic-service-details{padding-inline-end:var(--traffic-chevron-space)}
+.service-traffic-row .detail-row>b:first-child{text-align:start}
+.service-traffic-row .traffic-bar{display:block;margin-block:4px}
+.service-traffic-row .traffic-bar>span{display:block;height:100%;background:var(--brand-color);border-radius:inherit}
+.service-traffic-row .detail-row.footnote{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));margin:0;padding:0}
+.service-traffic-controls{margin-block:var(--space-4)}
+.service-traffic-controls .motion-row{gap:var(--space-3)}
+.service-traffic-controls .motion-row span{min-width:0;overflow-wrap:anywhere}
+.service-traffic-row summary{display:grid;grid-template-columns:minmax(0,1fr) var(--traffic-chevron-space);align-items:start;min-height:44px;cursor:pointer;list-style:none}
+.service-traffic-row summary::-webkit-details-marker{display:none}
+.traffic-group-chevron{display:flex;justify-content:flex-end;padding-block-start:6px;color:var(--tg-theme-hint-color)}
+.traffic-group-overview{min-width:0}
+.service-traffic-row summary svg{width:16px;height:16px}
+.service-traffic-row[open] summary svg{transform:rotate(90deg)}
+.traffic-service-details{list-style:none;margin:8px 0 0;padding-inline-start:0}
+.traffic-service-details .detail-row>span:first-child{padding-inline-start:var(--space-4)}
+.traffic-service-details li{margin-block:4px}
