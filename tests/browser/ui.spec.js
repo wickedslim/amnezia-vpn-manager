@@ -164,3 +164,170 @@ test('what is new stays in app and returns to the update confirmation',async({pa
  await expect(page.locator('#modal').getByRole('button',{name:'Обновить',exact:true})).toBeEnabled();
  await expect(page).toHaveURL(/#\/settings$/);
 });
+
+test('dropdown lists in forms open over the form without changing its height', async ({page}) => {
+  await page.setViewportSize({width: 375, height: 740});
+  await page.goto('/#/clients');
+  await page.locator('[data-action="create"]').click();
+  const dialog = page.locator('#modal');
+  const before = (await dialog.boundingBox()).height;
+  const menu = dialog.locator('.filter-menu').last();
+  await menu.locator('summary').click();
+  const options = menu.locator('.filter-options');
+  await expect(options).toBeVisible();
+  expect(await options.evaluate(el => getComputedStyle(el).position)).toBe('absolute');
+  expect((await dialog.boundingBox()).height).toBeCloseTo(before, 0);
+});
+test('page under an open form does not scroll and keeps its place after closing', async ({page}) => {
+  await page.setViewportSize({width: 375, height: 500});
+  await page.goto('/#/clients');
+  await expect(page.locator('.client-card').first()).toBeVisible();
+  const create = page.locator('[data-action="create"]');
+  await create.scrollIntoViewIfNeeded();
+  await page.evaluate(() => scrollBy(0, 120));
+  const y = await page.evaluate(() => scrollY);
+  expect(y).toBeGreaterThan(0);
+  await create.evaluate(el => el.click());
+  const dialog = page.locator('#modal');
+  await expect(dialog).toBeVisible();
+  const shell = page.locator('.app-shell');
+  const top = (await shell.boundingBox()).y;
+  await page.mouse.move(4, 4);
+  await page.mouse.wheel(0, 400);
+  await page.waitForTimeout(150);
+  expect((await shell.boundingBox()).y).toBeCloseTo(top, 0);
+  await dialog.locator('[data-action="close"]').click();
+  await expect(dialog).toBeHidden();
+  expect(await page.evaluate(() => scrollY)).toBe(y);
+});
+test('one form changes access and limits and sends only what changed', async ({page}) => {
+  await page.setViewportSize({width: 375, height: 740});
+  await page.goto('/#/client/1/9');
+  await expect(page.getByRole('button', {name: 'Приостановить доступ'})).toHaveCount(0);
+  await expect(page.getByRole('button', {name: 'Изменить ограничения'})).toHaveCount(0);
+  const sent = [];
+  page.on('request', request => { if (request.method() === 'PATCH') sent.push([new URL(request.url()).pathname.replace(/^.*\/clients\/9\//, ''), request.postDataJSON()]); });
+  const dialog = page.locator('#modal');
+  const access = page.getByRole('button', {name: 'Доступ и ограничения'});
+  const save = () => dialog.getByRole('button', {name: 'Сохранить'}).click();
+  const choose = async value => { await dialog.locator('#form-access-menu summary').click(); await dialog.locator(`#form-access-menu [data-filter-option="${value}"]`).click(); };
+
+  await access.click();
+  await choose('off');
+  await save();
+  await expect(dialog).toBeHidden();
+  await expect(page.locator('main')).toContainText('Доступ приостановлен');
+  expect(sent).toEqual([['pause', {paused: true}]]);
+
+  sent.length = 0;
+  await access.click();
+  await choose('on');
+  await dialog.locator('input[name="limit"]').fill('5');
+  await save();
+  await expect(dialog).toBeHidden();
+  expect(sent.map(([path]) => path)).toEqual(['policy', 'pause']);
+  expect(sent[0][1].limit).toBe(5 * 1024 ** 3);
+  expect(sent[1][1]).toEqual({paused: false});
+
+  sent.length = 0;
+  await access.click();
+  await save();
+  await expect(dialog).toBeHidden();
+  expect(sent).toEqual([]);
+});
+test('access form shows only the parts the administrator may change', async ({page}) => {
+  let permissions = {pause: true, delete: false};
+  await page.route('**/api/overview*', async route => {
+    const response = await route.fetch();
+    const body = await response.json();
+    body.servers.forEach(server => { server.permissions = {...server.permissions, ...permissions}; });
+    await route.fulfill({response, json: body});
+  });
+  await page.goto('/#/client/1/9');
+  const dialog = page.locator('#modal');
+  await page.getByRole('button', {name: 'Доступ и ограничения'}).click();
+  await expect(dialog.locator('select[name="access"]')).toHaveCount(1);
+  await expect(dialog.locator('input[name="limit"]')).toHaveCount(0);
+  await dialog.getByRole('button', {name: 'Отмена'}).click();
+  permissions = {pause: false, delete: false};
+  await page.reload();
+  await expect(page.getByRole('button', {name: 'Имя и комментарий'})).toBeVisible();
+  await expect(page.getByRole('button', {name: 'Доступ и ограничения'})).toHaveCount(0);
+});
+test('cards keep equal space above and below their content', async ({page}) => {
+  await page.setViewportSize({width: 375, height: 740});
+  for (const route of ['/#/server/1', '/#/client/1/9', '/#/settings', '/#/audit']) {
+    await page.goto(route);
+    await expect(page.locator('main .surface').first()).toBeVisible();
+    await page.waitForTimeout(400);
+    const uneven = await page.evaluate(() => [...document.querySelectorAll('main .surface')].flatMap(card => {
+      if (card.offsetParent === null || card.classList.contains('client-card')) return [];
+      const kids = [...card.children].filter(kid => kid.offsetHeight > 0);
+      if (!kids.length) return [];
+      const box = card.getBoundingClientRect();
+      const top = kids[0].getBoundingClientRect().top - box.top;
+      const bottom = box.bottom - kids.at(-1).getBoundingClientRect().bottom;
+      return Math.abs(bottom - top) > 4 ? [`${card.className}: ${Math.round(top)}/${Math.round(bottom)}`] : [];
+    }));
+    expect(uneven, route).toEqual([]);
+  }
+});
+test('enter in client search keeps the query and closes the keyboard', async ({page}) => {
+  await page.goto('/#/clients');
+  const search = page.getByRole('searchbox');
+  await expect(search).toHaveAttribute('enterkeyhint', 'search');
+  await search.fill('Kolida');
+  await search.press('Enter');
+  await expect(search).not.toBeFocused();
+  await expect(search).toHaveValue('Kolida');
+  await expect(page.locator('.client-card').first()).toContainText('Kolida');
+});
+test('cross in client search clears it and shows every client again', async ({page}) => {
+  await page.goto('/#/clients');
+  const cards = page.locator('.client-card');
+  await expect(cards.first()).toBeVisible();
+  const all = await cards.count();
+  const search = page.getByRole('searchbox');
+  const clear = page.getByRole('button', {name: 'Очистить поиск'});
+  await expect(clear).toBeHidden();
+  await search.fill('Kolida');
+  await expect(clear).toBeVisible();
+  expect(await cards.count()).toBeLessThan(all);
+  await clear.click();
+  await expect(search).toHaveValue('');
+  await expect(clear).toBeHidden();
+  await expect(cards).toHaveCount(all);
+  await expect(search).not.toBeFocused();
+  await search.fill('Kolida');
+  await clear.focus();
+  await page.keyboard.press('Enter');
+  await expect(search).toHaveValue('');
+  await expect(search).toBeFocused();
+  await page.goto('/#/clients');
+  await expect(clear).toBeHidden();
+});
+test('page fields use at least 16px text so iOS does not zoom in on focus', async ({page}) => {
+  const size = async locator => parseFloat(await locator.evaluate(el => getComputedStyle(el).fontSize));
+  await page.goto('/#/clients');
+  expect(await size(page.getByRole('searchbox'))).toBeGreaterThanOrEqual(16);
+  await page.locator('.client-card').first().click();
+  await expect(page.locator('.daily-card #daily-month')).toBeAttached();
+  await expect.poll(() => size(page.locator('.daily-card #daily-month'))).toBeGreaterThanOrEqual(16);
+});
+test('online dots use one colour on every screen and in both themes', async ({page}) => {
+  const colours = () => page.evaluate(() => [...document.querySelectorAll('.dot:not(.off):not(.error),.live-pill:not(.disconnected) i')].map(el => getComputedStyle(el).backgroundColor));
+  for (const theme of ['light', 'dark']) {
+    const seen = new Set();
+    for (const route of ['/', '/#/clients']) {
+      await page.goto(route);
+      await page.evaluate(theme => { document.documentElement.dataset.theme = theme; }, theme);
+      await expect(page.locator('.dot:not(.off):not(.error)').first()).toBeVisible();
+      (await colours()).forEach(c => seen.add(c));
+    }
+    await page.locator('.client-card:has(.client-status:not(.off):not(.error))').first().click();
+    await expect(page.locator('.hero .dot')).toBeVisible();
+    await page.evaluate(theme => { document.documentElement.dataset.theme = theme; }, theme);
+    (await colours()).forEach(c => seen.add(c));
+    expect([...seen], theme).toEqual(['rgb(32, 231, 122)']);
+  }
+});

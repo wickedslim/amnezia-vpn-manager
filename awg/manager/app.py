@@ -62,13 +62,15 @@ class ConflictGuard(BaseRequestMiddleware):
             raise
 
 
-async def monitor(service: VPNService, bot: Bot, admin: int, interval: int):
+async def monitor(service: VPNService, bot: Bot, admin: int, interval: int, widgets=None):
     while True:
         try:
             notifications = await service.monitor_once()
             await notify_health(service.store, bot, admin)
             for sid, text in notifications:
                 await bot.send_message(admin, f"{e(service.store.server(sid).name)}\n{e(text)}")
+            if widgets:
+                await widgets.update_all()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -80,7 +82,11 @@ async def run(settings: Settings, store: Store) -> int:
     bot = Bot(settings.token, default=DefaultBotProperties(parse_mode="HTML"))
     service = VPNService(store)
     dispatcher = Dispatcher(disable_fsm=True)
-    dispatcher.include_router(UI(bot, store, service, settings.admin_id).router)
+    ui = UI(bot, store, service, settings.admin_id)
+    dispatcher.include_router(ui.router)
+    if os.environ.get("AWG_WIDGETS") == "1":
+        from .widgets import WidgetCards
+        ui.widgets = WidgetCards(bot, store, service, ui.access)
     conflict = asyncio.Event()
     bot.session.middleware(ConflictGuard(conflict))
     background = polling = conflict_wait = None
@@ -103,7 +109,7 @@ async def run(settings: Settings, store: Store) -> int:
             BotCommand(command="cancel", description="Отменить текущий ввод"),
             BotCommand(command="id", description="Мой Telegram ID"),
         ])
-        background = asyncio.create_task(monitor(service, bot, settings.admin_id, settings.poll_seconds))
+        background = asyncio.create_task(monitor(service, bot, settings.admin_id, settings.poll_seconds, ui.widgets))
         polling = asyncio.create_task(dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types(), close_bot_session=False))
         conflict_wait = asyncio.create_task(conflict.wait())
         await asyncio.wait([polling, conflict_wait], return_when=asyncio.FIRST_COMPLETED)

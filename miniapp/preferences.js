@@ -16,7 +16,7 @@ export function applyPreferences(p=draft||preferences){
  root.dataset.theme=isDark?'dark':'light';root.dataset.density=p.density;root.dataset.motion=p.motion&&!reduced.matches?'on':'off';
  const accent={brand:'#FF4302',lime:'#C5F35B',pink:'#FF7CAF',custom:p.customAccent}[p.palette],rgb=hex(accent);
  const on=accent==='#FF4302'?'#FFFFFF':contrast(rgb,[22,22,22])>contrast(rgb,[255,255,255])?'#161616':'#FFFFFF';
- root.style.setProperty('--action-bg',isDark||on==='#FFFFFF'?readable(rgb,[255,255,255],false):accent);root.style.setProperty('--brand-color',accent);root.style.setProperty('--accent-text',readable(rgb,hex(isDark?'#202020':'#FFFFFF'),isDark));root.style.setProperty('--accent-on',on);root.style.setProperty('--orange-soft',`rgba(${rgb.join(',')},${isDark?'.16':'.10'})`);root.style.setProperty('--text-scale',String(p.fontSize/14));
+ root.style.setProperty('--action-bg',isDark||on==='#FFFFFF'?readable(rgb,[255,255,255],false):accent);root.style.setProperty('--brand-color',accent);root.style.setProperty('--accent-text',readable(rgb,hex(isDark?'#202020':'#F4F4F6'),isDark));root.style.setProperty('--accent-on',on);root.style.setProperty('--orange-soft',`rgba(${rgb.join(',')},${isDark?'.16':'.10'})`);root.style.setProperty('--text-scale',String(p.fontSize/14));
  // Explicit user themes override Telegram palette; auto follows its color scheme.
  for(const [k,v] of Object.entries(isDark?{'bg-color':'#111111','text-color':'#f5f5f5','hint-color':'#a1a1aa','secondary-bg-color':'#202020'}:{'bg-color':'#ffffff','text-color':'#18181b','hint-color':'#66666f','secondary-bg-color':'#f4f4f5'}))root.style.setProperty(`--tg-theme-${k}`,v);
 }

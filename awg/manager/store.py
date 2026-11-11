@@ -55,6 +55,8 @@ class Store:
             CREATE TABLE IF NOT EXISTS connections (client_id INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE, endpoint TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY(client_id,endpoint));
         """)
         columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(clients)")}
+        if "speed_limit" not in columns:
+            self.connection.execute("ALTER TABLE clients ADD COLUMN speed_limit INTEGER")
         if "last_handshake" not in columns:
             self.connection.execute("ALTER TABLE clients ADD COLUMN last_handshake INTEGER NOT NULL DEFAULT 0")
             self.connection.execute("UPDATE clients SET last_handshake=handshake")
@@ -179,10 +181,10 @@ class Store:
             row = self.connection.execute("SELECT * FROM clients WHERE id=? AND server_id=? AND present=1", (cid, sid)).fetchone()
         return dict(row) if row else self._missing("Клиент не найден. Обновите список клиентов.")
 
-    def set_policy(self, sid: int, cid: int, expires: int | None, limit: int | None):
+    def set_policy(self, sid: int, cid: int, expires: int | None, limit: int | None, speed: int | None = None):
         self.client(sid, cid)
         with self.transaction() as conn:
-            conn.execute("UPDATE clients SET expires=?,traffic_limit=? WHERE server_id=? AND id=?", (expires, limit, sid, cid))
+            conn.execute("UPDATE clients SET expires=?,traffic_limit=?,speed_limit=? WHERE server_id=? AND id=?", (expires, limit, speed, sid, cid))
 
         from .audit import record
         record(self,"client.policy","ok",sid,cid)
@@ -256,6 +258,14 @@ class Store:
             totals = conn.execute("SELECT COALESCE(SUM(total_rx),0),COALESCE(SUM(total_tx),0) FROM clients WHERE server_id=?", (sid,)).fetchone()
             conn.execute("INSERT OR REPLACE INTO samples VALUES (?,?,?,?,?)", (sid, now, *totals, sum(p.online for p in peers)))
             conn.execute("DELETE FROM samples WHERE ts<?", (now - 7 * 86400,))
+
+    def server_totals(self, sid: int, day: str, month: str) -> dict:
+        """Traffic of all clients of a server for one day and one month (Europe/Samara keys).
+        In these tables tx is what devices receive."""
+        with self.lock:
+            today = self.connection.execute("SELECT COALESCE(SUM(d.rx),0),COALESCE(SUM(d.tx),0) FROM daily d JOIN clients c ON c.id=d.client_id WHERE c.server_id=? AND d.day=?", (sid, day)).fetchone()
+            period = self.connection.execute("SELECT COALESCE(SUM(m.rx),0),COALESCE(SUM(m.tx),0) FROM monthly m JOIN clients c ON c.id=m.client_id WHERE c.server_id=? AND m.month=?", (sid, month)).fetchone()
+        return {"day_down": today[1], "day_up": today[0], "month_down": period[1], "month_up": period[0]}
 
     def samples(self, sid: int, limit=20) -> list[dict]:
         with self.lock:

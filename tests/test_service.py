@@ -1,6 +1,10 @@
 import asyncio
 import base64
+import hashlib
 import json
+import os
+import subprocess
+import sys
 import time
 import unittest
 from pathlib import Path
@@ -81,6 +85,63 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                 source = Path(__file__).resolve().parents[1] / "scripts" / name
                 self.assertEqual(base64.b64decode(line), source.read_bytes())
             self.assertTrue(all("--now" not in call.args[0] for call in install_runner.run.call_args_list))
+
+    READY = ("LoadState=loaded\nUnitFileState=enabled\nActiveState=active\n"
+             "ExecStart={ argv[]=/opt/amnezia-service-traffic/venv/bin/python "
+             "/opt/amnezia-service-traffic/collector.py collect amnezia-awg wg0 ; }")
+
+    async def test_outdated_collector_is_replaced_once_per_start(self):
+        sid = self.server.id
+        source = (Path(__file__).resolve().parents[1] / "scripts" / "service_traffic.py").read_bytes()
+        with patch.object(self.service.runner(sid), "run", create=True,
+                          side_effect=[self.READY, "0" * 64 + "  /opt/amnezia-service-traffic/collector.py\n", ""]) as run:
+            self.assertTrue(await self.service.refresh_service_traffic(sid))
+            self.assertFalse(await self.service.refresh_service_traffic(sid))
+        command, payload = run.call_args_list[2].args
+        self.assertIn("try-restart amnezia-service-traffic.service", command)
+        self.assertEqual(base64.b64decode(payload), source)
+        self.assertEqual(run.call_count, 3)
+
+    async def test_current_foreign_or_missing_collector_is_left_alone(self):
+        sid = self.server.id
+        source = (Path(__file__).resolve().parents[1] / "scripts" / "service_traffic.py").read_bytes()
+        current = hashlib.sha256(source).hexdigest() + "  /opt/amnezia-service-traffic/collector.py\n"
+        for outputs in ([self.READY, current], [self.READY.replace("wg0", "wg1")], ["LoadState=not-found"]):
+            self.service.traffic_refreshed.clear()
+            with patch.object(self.service.runner(sid), "run", create=True, side_effect=outputs) as run:
+                self.assertFalse(await self.service.refresh_service_traffic(sid))
+            self.assertEqual(run.call_count, len(outputs))
+            self.assertIn(sid, self.service.traffic_refreshed)
+
+    async def test_unreachable_server_is_checked_again_later(self):
+        sid = self.server.id
+        with patch.object(self.service.runner(sid), "run", create=True, side_effect=ManagerError("network")):
+            with self.assertRaises(ManagerError):
+                await self.service.refresh_service_traffic(sid)
+        self.assertNotIn(sid, self.service.traffic_refreshed)
+
+    def test_update_script_replaces_only_with_a_file_that_compiles(self):
+        from manager.service import TRAFFIC_COLLECTOR, TRAFFIC_PYTHON, TRAFFIC_UPDATE_COMMAND
+        root = Path(self.tmp.name) / "vps"
+        (root / "bin").mkdir(parents=True)
+        collector = root / "collector.py"
+        collector.write_text("OLD = 1\n")
+        systemctl = root / "bin" / "systemctl"
+        systemctl.write_text(f'#!/bin/sh\necho "$@" >> {root}/systemctl.log\n')
+        systemctl.chmod(0o755)
+        script = TRAFFIC_UPDATE_COMMAND.replace(TRAFFIC_COLLECTOR, str(collector)).replace(TRAFFIC_PYTHON, sys.executable)
+        env = {**os.environ, "PATH": f"{root / 'bin'}{os.pathsep}{os.environ['PATH']}"}
+        def apply(text):
+            return subprocess.run(["sh", "-c", script], input=base64.b64encode(text.encode()) + b"\n", env=env, capture_output=True)
+        self.assertNotEqual(apply("def broken(:\n").returncode, 0)
+        self.assertEqual(collector.read_text(), "OLD = 1\n")
+        self.assertFalse((root / "collector.py.new").exists())
+        self.assertFalse((root / "systemctl.log").exists())
+        self.assertEqual(apply("NEW = 2\n").returncode, 0)
+        self.assertEqual(collector.read_text(), "NEW = 2\n")
+        self.assertEqual(oct(collector.stat().st_mode & 0o777), "0o644")
+        self.assertFalse((root / "collector.py.new").exists())
+        self.assertEqual((root / "systemctl.log").read_text(), "--no-ask-password try-restart amnezia-service-traffic.service\n")
 
     async def test_traffic_install_can_enable_collection_after_installation(self):
         sid = self.server.id
@@ -251,6 +312,78 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([v['userData']['clientName'] for v in table if v['clientId']==result['public_key']],['phone'])
         with self.assertRaises(ManagerError):await self.service.reissue_client(sid,cid,old_key)
         self.assertNotIn('down',(self.vpn/'commands').read_text())
+
+    async def test_peer_changes_keep_obfuscation_parameters_on_the_running_interface(self):
+        # AmneziaWG drops Jc/S*/H* on every runtime peer change; clients then cannot handshake.
+        expected = {"jc": "4", "s3": "25", "i1": "<b 0x00>"}
+        runtime = lambda: json.loads((self.vpn / "runtime.json").read_text())["params"]
+        self.assertEqual(runtime(), expected)
+        sid = self.server.id
+        created = await self.service.create_client(sid, "phone", None, None)
+        self.assertEqual(runtime(), expected)
+        reissued = await self.service.reissue_client(sid, created["id"], created["public_key"])
+        self.assertEqual(runtime(), expected)
+        await self.service.set_paused(sid, reissued["id"], True)
+        self.assertEqual(runtime(), expected)
+        await self.service.set_paused(sid, reissued["id"], False)
+        self.assertEqual(runtime(), expected)
+        await self.service.delete_client(sid, reissued["id"])
+        self.assertEqual(runtime(), expected)
+
+    async def test_rename_changes_only_the_client_table(self):
+        sid = self.server.id
+        created = await self.service.create_client(sid, "phone", None, None)
+        config_before = (self.vpn / "wg0.conf").read_text()
+        runtime_before = (self.vpn / "runtime.json").read_text()
+        commands_before = (self.vpn / "commands").read_text()
+        renamed = await self.service.rename_client(sid, created["id"], "  Мамин телефон ")
+        self.assertEqual(renamed["name"], "Мамин телефон")
+        self.assertEqual(renamed["public_key"], created["public_key"])
+        self.assertEqual(renamed["config"], created["config"])
+        table = json.loads((self.vpn / "clientsTable").read_text())
+        entry = next(e for e in table if e["clientId"] == created["public_key"])
+        self.assertEqual(entry["userData"]["clientName"], "Мамин телефон")
+        self.assertIn("creationDate", entry["userData"])
+        self.assertEqual((self.vpn / "wg0.conf").read_text(), config_before)
+        self.assertEqual((self.vpn / "runtime.json").read_text(), runtime_before)
+        new_commands = (self.vpn / "commands").read_text()[len(commands_before):]
+        self.assertFalse([line for line in new_commands.splitlines() if line.startswith(("set", "addconf"))])
+        # Survives a fresh read of the server.
+        await self.service.snapshot(sid, force=True)
+        self.assertEqual(self.store.client(sid, created["id"])["name"], "Мамин телефон")
+
+    async def test_rename_rejects_a_taken_name_and_bad_input(self):
+        sid = self.server.id
+        first = await self.service.create_client(sid, "phone", None, None)
+        await self.service.create_client(sid, "tablet", None, None)
+        table_before = (self.vpn / "clientsTable").read_text()
+        with self.assertRaisesRegex(ManagerError, "уже есть"):
+            await self.service.rename_client(sid, first["id"], "TABLET")
+        with self.assertRaises(ManagerError):
+            await self.service.rename_client(sid, first["id"], "a\nb")
+        with self.assertRaises(ManagerError):
+            await self.service.rename_client(sid, first["id"], "  ")
+        self.assertEqual((self.vpn / "clientsTable").read_text(), table_before)
+        # Same name in another case is just a rename of the same client.
+        self.assertEqual((await self.service.rename_client(sid, first["id"], "Phone"))["name"], "Phone")
+
+    async def test_rename_of_a_paused_client_survives_resume(self):
+        sid = self.server.id
+        client = await self.service.create_client(sid, "phone", None, None)
+        await self.service.set_paused(sid, client["id"], True)
+        await self.service.rename_client(sid, client["id"], "old phone")
+        self.assertEqual(self.store.client(sid, client["id"])["name"], "old phone")
+        await self.service.set_paused(sid, client["id"], False)
+        await self.service.snapshot(sid, force=True)
+        self.assertEqual(self.store.client(sid, client["id"])["name"], "old phone")
+
+    async def test_failed_reissue_rollback_also_keeps_obfuscation_parameters(self):
+        expected = {"jc": "4", "s3": "25", "i1": "<b 0x00>"}
+        created = await self.service.create_client(self.server.id, "phone", None, None)
+        (self.vpn / "fail_add_once").write_text("")
+        with self.assertRaises(ManagerError):
+            await self.service.reissue_client(self.server.id, created["id"], created["public_key"])
+        self.assertEqual(json.loads((self.vpn / "runtime.json").read_text())["params"], expected)
 
     async def test_reissue_rollback_restores_old_peer_on_new_key_failure(self):
         created=await self.service.create_client(self.server.id,'phone',None,None)

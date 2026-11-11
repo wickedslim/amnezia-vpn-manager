@@ -2,14 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from contextvars import ContextVar
-import base64
 import ipaddress
 import logging
 import re
 import secrets
-import struct
 import time
-import zlib
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -21,6 +18,7 @@ from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from .access import Access
+from .amnezia_key import vpn_key
 from .domain import ManagerError, Server, validate_name
 from .service import VPNService
 from .reissue import Reissues
@@ -101,6 +99,7 @@ class UI:
         self.access=Access(store,admin_id)
         self.revisions={}
         self.reissue_controllers={}
+        self.widgets=None
         self.router = Router()
         self.router.message.outer_middleware(AccessMiddleware(admin_id,self.access,self.actor))
         self.router.callback_query.outer_middleware(AccessMiddleware(admin_id,self.access,self.actor))
@@ -226,7 +225,7 @@ class UI:
         )
         if self.store.pending_imports(sid):
             text += "\n\n⚠️ Часть старых лимитов не сопоставлена с клиентами. Проверьте ограничения одноимённых клиентов в их карточках."
-        await self.panel(text, keyboard([("Клиенты", f"list:{sid}:0"), ("＋ Клиент", f"newclient:{sid}")], [("↻ Обновить", f"sr:{sid}"), ("Резервная копия", f"backup:{sid}")], [("Статистика по месяцам", f"months:{sid}:0")], [("Настройки сервера", f"settings:{sid}")], [("‹ Все серверы", "home")]), revision)
+        await self.panel(text, keyboard([("Клиенты", f"list:{sid}:0"), ("＋ Клиент", f"newclient:{sid}")], [("↻ Обновить", f"sr:{sid}"), ("Резервная копия", f"backup:{sid}")], [("Статистика по месяцам", f"months:{sid}:0")], ([("Убрать живую карточку", f"widgetoff:{sid}")] if self.widgets.is_open(self.admin_id, sid) else [("Живая карточка", f"widget:{sid}")]) if self.widgets else None, [("Настройки сервера", f"settings:{sid}")], [("‹ Все серверы", "home")]), revision)
 
     async def clients(self, sid, page=0, revision=None, force=False, query=""):
         server = self.store.server(sid)
@@ -275,7 +274,7 @@ class UI:
         try:
             if action in {"newserver","editserver","settings","unlink","unlinkyes","backup"}:self.access.require_owner(self.admin_id)
             if action in {"s","sr","list","lr","c","cr","months","report","csv","newclient",
-                          "policy","search","reissue","reissueyes","delete","deleteyes","conf","ip","pause","resume"}:
+                          "policy","search","reissue","reissueyes","delete","deleteyes","conf","ip","pause","resume","widget"}:
                 operation = {"reissue":"reissue","reissueyes":"reissue","delete":"delete","deleteyes":"delete",
                              "pause":"pause","resume":"pause","policy":"delete"}.get(action)
                 if not self.access.permits(self.admin_id, int(parts[1]), operation):
@@ -360,17 +359,22 @@ class UI:
                 filename = re.sub(r"[^\w.-]", "_", client["name"])[:40] or str(cid)
                 await self.bot.send_document(self.admin_id, BufferedInputFile(text.encode(), filename=f"{filename}.conf"), caption=f"{e(self.store.server(sid).name)} · {e(client['name'])}")
                 audit.record(self.store,'config.download','ok',sid,cid)
-                raw = text.encode()
-                vpn = "vpn://" + base64.urlsafe_b64encode(struct.pack(">I", len(raw)) + zlib.compress(raw, 8)).decode().rstrip("=")
-                if len(vpn) < 3800:
-                    await self.bot.send_message(self.admin_id, f"<b>Ключ для AmneziaVPN</b>\n<code>{e(vpn)}</code>")
-                else:
-                    await self.bot.send_document(self.admin_id, BufferedInputFile(vpn.encode(), filename=f"{filename}-vpn.txt"))
+                try:
+                    vpn = vpn_key(text, self.store.server(sid).name, client["public_key"])
+                except ManagerError:
+                    return  # the .conf above is enough for an unusual config
+                await self.bot.send_document(self.admin_id, BufferedInputFile(vpn.encode(), filename=f"{filename}.vpn"), caption="Для приложения AmneziaVPN")
             elif action == "backup":
                 sid = int(parts[1])
                 await send_backup(self.bot, self.service, self.admin_id, sid)
             elif action == "ip":
                 await self.ip_info(int(parts[1]), int(parts[2]), revision)
+            elif action == "widget" and self.widgets:
+                await self.widgets.open(self.admin_id, int(parts[1]))
+                await self.server(int(parts[1]), revision)
+            elif action == "widgetoff" and self.widgets:
+                await self.widgets.close(self.admin_id, int(parts[1]))
+                await self.server(int(parts[1]), revision)
             else:
                 raise ManagerError("Эта кнопка устарела. Откройте главную через /servers.")
         except (ValueError, IndexError):

@@ -142,25 +142,37 @@ def write_peer(runner: Runner, *, before: str, after: str, table_before: str, ta
     The VPN interface is never stopped. Every successful mutation leaves a server-side backup.
     """
     import base64
+    import re
     values = [before, after, table_before, table_after, psk, old_peer]
     payload = b"".join(base64.b64encode(value.encode()) + b"\n" for value in values)
-    action = f'"$WG" set {q(interface)} peer {q(key)} remove' if remove else f'"$WG" set {q(interface)} peer {q(key)} preshared-key "$tmp/psk" allowed-ips {q(allowed_ips)}'
-    rollback = f'"$WG" addconf {q(interface)} "$tmp/peer"' if remove else f'"$WG" set {q(interface)} peer {q(key)} remove'
+    # AmneziaWG resets its obfuscation parameters (Jc, S*, H*, ...) to defaults on every runtime
+    # change of a peer ("wg set" and "wg addconf"). The server then stops understanding all clients
+    # until the container restarts. Every runtime command therefore carries the parameters from
+    # the interface section of the saved configuration.
+    interface_text = after.split("[Peer]", 1)[0]
+    parameters = [(name.lower(), value.strip()) for name, value in re.findall(
+        r"(?m)^\s*(Jc|Jmin|Jmax|S[1-4]|H[1-4]|I[1-5]|J[1-3]|Itime)\s*=\s*(\S[^\n]*)$", interface_text, re.I)]
+    keep = " ".join(f"{name} {q(value)}" for name, value in parameters)
+    def run_set(tail):
+        return f'"$WG" set {q(interface)} {keep + " " if keep else ""}{tail}'
+    reapply = f'"$WG" set {q(interface)} {keep}' if keep else ':'
+    action = run_set(f'peer {q(key)} remove') if remove else run_set(f'peer {q(key)} preshared-key "$tmp/psk" allowed-ips {q(allowed_ips)}')
+    rollback = f'"$WG" addconf {q(interface)} "$tmp/peer"' if remove else run_set(f'peer {q(key)} remove')
     if restore_peer:
         action = f'"$WG" addconf {q(interface)} "$tmp/peer"'
     if add_peers:
         from .domain import validate_key
         action = f'"$WG" addconf {q(interface)} "$tmp/peer"'
         rollback = "\n        ".join(
-            f'"$WG" set {q(interface)} peer {q(validate_key(peer))} remove || true' for peer in add_peers
+            run_set(f'peer {q(validate_key(peer))} remove') + ' || true' for peer in add_peers
         )
     if replace_key:
         from .domain import validate_key
         validate_key(replace_key)
-        action = f'"$WG" set {q(interface)} peer {q(replace_key)} remove\n' + action
-        rollback = f'"$WG" set {q(interface)} peer {q(key)} remove || true\n        "$WG" addconf {q(interface)} "$tmp/peer"'
+        action = run_set(f'peer {q(replace_key)} remove') + '\n' + action
+        rollback = run_set(f'peer {q(key)} remove') + ' || true\n        "$WG" addconf ' + q(interface) + ' "$tmp/peer"'
     if table_only:
-        action = rollback = ":"
+        action = rollback = reapply = ":"
     script = f"""set -eu
 umask 077
 {WG_SELECT}
@@ -177,6 +189,7 @@ cleanup() {{
         cp "$tmp/old" "$cfg" || true
         if test "$table_existed" -eq 1; then cp "$tmp/table.old" "$table" || true; else rm -f "$table"; fi
         {rollback} || true
+        {reapply} || true
     fi
     rm -rf "$tmp"
     exit "$status"
@@ -195,6 +208,7 @@ cp "$cfg" "$cfg.manager-backup"
 if test "$table_existed" -eq 1; then cp "$table" "$table.manager-backup"; fi
 changed=1
 {action}
+{reapply}
 mv "$tmp/new" "$cfg"
 mv "$tmp/table.new" "$table"
 changed=0

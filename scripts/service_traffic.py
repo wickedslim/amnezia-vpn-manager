@@ -98,6 +98,32 @@ def category(application, hostname, confidence, dpi_category=""):
     return "unknown"
 
 
+class Continuations:
+    """NFStream cuts a long connection every active_timeout and dissects each piece anew. Only
+    the first piece carries the server name, so a long video would otherwise count as two
+    minutes of the service and the rest as "unknown". A piece inherits the category of the
+    piece before it on the same 5-tuple."""
+
+    GAP_MS = 30_000  # the next piece starts with the next packet; a longer silence is a new connection
+
+    def __init__(self, limit=16384):
+        self.known = {}
+        self.limit = limit
+
+    def label(self, protocol, src, sport, dst, dport, first, last, expired_active, name):
+        key = (protocol, *sorted(((src, sport), (dst, dport))))
+        previous = self.known.pop(key, None)
+        if previous and previous[0] != "unknown" and 0 <= first - previous[1] <= self.GAP_MS:
+            name = previous[0]
+        if expired_active:
+            if len(self.known) >= self.limit:
+                self.known = {k: v for k, v in self.known.items() if last - v[1] <= self.GAP_MS}
+                if len(self.known) >= self.limit:
+                    self.known.clear()
+            self.known[key] = (name, last)
+        return name
+
+
 def peer_addresses(text):
     addresses = {}
     for line in text.splitlines():
@@ -123,10 +149,14 @@ def capture(interface):
                        bpf_filter="tcp or udp", n_meters=1, accounting_mode=1,
                        snapshot_length=1536, idle_timeout=15, active_timeout=120,
                        n_dissections=20)
+    pieces = Continuations()
     for flow in flows:
         # The pipe is private. Hostnames and service signatures stay in this process.
         name = category(flow.application_name, flow.requested_server_name,
                         flow.application_confidence or 0, flow.application_category_name)
+        name = pieces.label(flow.protocol, flow.src_ip, flow.src_port, flow.dst_ip, flow.dst_port,
+                            flow.bidirectional_first_seen_ms, flow.bidirectional_last_seen_ms,
+                            flow.expiration_id == 1, name)
         row = (flow.src_ip, flow.dst_ip, flow.src2dst_bytes, flow.dst2src_bytes,
                flow.bidirectional_first_seen_ms, flow.bidirectional_last_seen_ms, name)
         print(json.dumps(row), flush=True)
