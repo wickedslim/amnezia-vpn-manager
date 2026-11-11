@@ -126,7 +126,8 @@ def create_demo():
             return {}
         async def probe(self,server):
             if not server.host.endswith('.example'):raise ValueError('Demo accepts .example hosts only')
-        async def create_client(self,sid,name,duration,limit):
+        async def apply_speed(self,sid):return None
+        async def create_client(self,sid,name,duration,limit,speed=None):
             from manager.domain import validate_name,ManagerError
             validate_name(name)
             if any(c['name']==name for c in store.clients(sid)):raise ManagerError('Клиент с таким именем уже есть.')
@@ -136,8 +137,20 @@ def create_demo():
             peers.append(Peer(key,name,f'10.8.{sid}.{len(existing)+20}/32',''))
             store.sync(sid,peers,'demo-public')
             c=next(c for c in store.clients(sid) if c['public_key']==key)
-            store.set_policy(sid,c['id'],int(time.time())+duration if duration else None,limit)
+            store.set_policy(sid,c['id'],int(time.time())+duration if duration else None,limit,speed)
             return store.client(sid,c['id'])
+        async def rename_client(self,sid,cid,name):
+            from manager.domain import validate_name,ManagerError
+            name=validate_name(name)
+            if any(c['name'].casefold()==name.casefold() and c['id']!=cid for c in store.clients(sid)):raise ManagerError('Клиент с таким именем на этом сервере уже есть.')
+            with store.transaction() as db:db.execute('UPDATE clients SET name=? WHERE id=? AND server_id=?',(name,cid,sid))
+            return store.client(sid,cid)
+        def paused(self,sid):return store.get_pref(f'paused_clients:{sid}',{})
+        async def set_paused(self,sid,cid,pause):
+            c=store.client(sid,cid);saved=dict(self.paused(sid))
+            if pause:saved[c['public_key']]={'name':c['name']}
+            else:saved.pop(c['public_key'],None)
+            store.set_pref(f'paused_clients:{sid}',saved)
         async def reissue_client(self,sid,cid,expected_key):
             from manager.domain import ManagerError
             c=store.client(sid,cid)

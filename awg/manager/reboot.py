@@ -6,12 +6,13 @@ import time
 from .domain import ManagerError
 
 # A transient systemd timer lets the HTTP response finish before the host stops.
+# systemd fires transient timers with up to a minute of slack by default, so the accuracy is
+# tightened to the promised delay. A unit left in the failed state by an earlier attempt would
+# block the fixed unit name, so it is reset first.
 REBOOT_COMMAND = '''set -eu
-if [ "$(id -u)" -eq 0 ]; then
-  systemd-run --quiet --unit=awg-manager-reboot --on-active=10s /usr/bin/systemctl reboot
-else
-  sudo -n systemd-run --quiet --unit=awg-manager-reboot --on-active=10s /usr/bin/systemctl reboot
-fi'''
+if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo -n"; fi
+$SUDO systemctl reset-failed awg-manager-reboot.service awg-manager-reboot.timer >/dev/null 2>&1 || true
+$SUDO systemd-run --quiet --unit=awg-manager-reboot --on-active=10s --timer-property=AccuracySec=1s /usr/bin/systemctl reboot'''
 
 
 class Reboots:

@@ -16,6 +16,7 @@ from pathlib import Path
 
 from .domain import ManagerError, Server, WGConfig, allocate_address, client_config, fields, Peer, parse_config, parse_dump, validate_key, validate_name
 from .audit import audited
+from . import shaping
 from .store import Store
 from .transport import Runner, WG_SELECT, q, read_snapshot, write_peer
 
@@ -35,6 +36,19 @@ for name in install-service-traffic.sh service_traffic.py; do
     printf '%s' "$payload" | base64 -d > "$work/$name"
 done
 timeout --kill-after=5s 180s bash "$work/install-service-traffic.sh" "$@"
+"""
+# The collector is copied to the VPS only at installation; this replaces it with the bundled
+# version. The file must compile with the collector's Python before it replaces the old one,
+# and only a running collector is restarted.
+TRAFFIC_UPDATE_COMMAND = f"""set -eu
+new={TRAFFIC_COLLECTOR}.new
+trap 'rm -f "$new"' EXIT
+umask 022
+base64 -d > "$new"
+{TRAFFIC_PYTHON} -c 'import sys; compile(open(sys.argv[1], "rb").read(), sys.argv[1], "exec")' "$new"
+chmod 0644 "$new"
+mv -f "$new" {TRAFFIC_COLLECTOR}
+systemctl --no-ask-password try-restart {TRAFFIC_UNIT}
 """
 
 
@@ -69,6 +83,8 @@ class VPNService:
         self.capacity = asyncio.Semaphore(4)
         self.traffic_installs: dict[int, asyncio.Task] = {}
         self.traffic_install_errors: dict[int, str] = {}
+        self.speed_checked: dict[int, tuple[dict, float]] = {}
+        self.traffic_refreshed: set[int] = set()
 
     def lock(self, sid: int):
         return self.locks.setdefault(sid, asyncio.Lock())
@@ -192,6 +208,42 @@ class VPNService:
         finally:
             self.traffic_installs.pop(sid, None)
 
+    async def refresh_service_traffic(self, sid: int) -> bool:
+        """Replace an installed collector that differs from the one bundled with the manager.
+
+        Only a collector this manager installed and can manage is touched; collected statistics
+        stay. Returns True when the file was replaced. Each server is checked once per start of
+        the manager; a server that could not be checked is tried again on the next call.
+        """
+        if sid in self.traffic_refreshed:
+            return False
+        server = self.store.server(sid)
+        try:
+            source = (TRAFFIC_SCRIPTS / "service_traffic.py").read_bytes()
+        except OSError:
+            self.traffic_refreshed.add(sid)
+            return False
+        bundled = hashlib.sha256(source).hexdigest()
+
+        def refresh():
+            runner = self.runner(sid)
+            if self._service_traffic_status(server, runner)["state"] != "ready":
+                return False
+            current = runner.run(f"sha256sum {TRAFFIC_COLLECTOR}", timeout=5).split()
+            if current and current[0] == bundled:
+                return False
+            runner.run("sh -c " + q(TRAFFIC_UPDATE_COMMAND), base64.b64encode(source) + b"\n", timeout=30)
+            return True
+
+        async with self.lock(sid):
+            if sid in self.traffic_installs:
+                return False  # the installation copies the bundled collector itself
+            updated = await self.worker(refresh)
+        self.traffic_refreshed.add(sid)
+        if updated:
+            log.info("Сборщик трафика по сервисам обновлён: server=%d", sid)
+        return updated
+
     def _set_service_traffic(self, server: Server, runner: Runner, enabled: bool) -> dict:
         if enabled:
             runner.run("systemctl is-active --quiet docker.service", timeout=5)
@@ -251,7 +303,41 @@ class VPNService:
         self.store.sync(sid, config.peers + paused, public)
         self.store.set_pref(f"health:{sid}", {"ok": True, "updated": snapshot.timestamp})
         self.cache[sid] = snapshot
+        try:
+            self._enforce_speed(sid, interface)
+        except ManagerError as exc:
+            log.warning("Ограничение скорости не применено: server=%d: %s", sid, exc)
         return snapshot
+
+    def _enforce_speed(self, sid: int, interface: str, force: bool = False) -> None:
+        """Make the tc rules inside the VPN container match the stored speed limits.
+
+        Servers without limits are never touched. Rules are rebuilt when limits change or when
+        they vanished (container restart); the check runs at most once a minute."""
+        limits = shaping.desired(self.store.clients(sid))
+        applied = self.store.get_pref(f"speed_active:{sid}") is True
+        if not limits and not applied:
+            return
+        previous, checked = self.speed_checked.get(sid, (None, 0.0))
+        now = time.monotonic()
+        if not force and previous == limits and now - checked < 60:
+            return
+        runner = self.runner(sid)
+        if previous is not None and previous != limits:
+            current = False
+        else:
+            current = shaping.in_sync(runner.docker(shaping.check_script(interface)), limits, interface)
+        if not current:
+            if previous == limits:
+                log.warning("Правила скорости пропали, применяю заново: server=%d", sid)
+            runner.docker(shaping.apply_script(interface, limits))
+        self.speed_checked[sid] = (limits, now)
+        self.store.set_pref(f"speed_active:{sid}", bool(limits))
+
+    async def apply_speed(self, sid: int) -> None:
+        server = self.store.server(sid)
+        async with self.lock(sid):
+            await self.worker(lambda: self._enforce_speed(sid, Path(server.config_path).stem, force=True))
 
     async def snapshot(self, sid: int, force=False) -> Snapshot:
         self.store.server(sid)
@@ -286,7 +372,7 @@ class VPNService:
         return dict(await asyncio.gather(*(one(s) for s in self.store.servers())))
 
     @audited('client.create')
-    async def create_client(self, sid: int, name: str, duration: int | None, limit: int | None) -> dict:
+    async def create_client(self, sid: int, name: str, duration: int | None, limit: int | None, speed: int | None = None) -> dict:
         name = validate_name(name)
         async with self.lock(sid):
             def operation():
@@ -315,7 +401,7 @@ printf '%s\\n' "$private" | "$WG" pubkey
                 generated = client_config(snapshot.config, address, private, snapshot.server_public, psk, server.endpoint)
                 # Persist the private key before touching the remote server.
                 with self.store.transaction() as conn:
-                    cursor = conn.execute("INSERT INTO clients(server_id,public_key,name,allowed_ips,config,expires,traffic_limit,present) VALUES (?,?,?,?,?,?,?,0)", (sid, public, name, address, generated, int(time.time()) + duration if duration else None, limit))
+                    cursor = conn.execute("INSERT INTO clients(server_id,public_key,name,allowed_ips,config,expires,traffic_limit,speed_limit,present) VALUES (?,?,?,?,?,?,?,?,0)", (sid, public, name, address, generated, int(time.time()) + duration if duration else None, limit, speed))
                     cid = cursor.lastrowid
                 block = f"[Peer]\n# {name}\nPublicKey = {public}\nPresharedKey = {psk}\nAllowedIPs = {address}\n"
                 peer = Peer(public, name, address, block)
@@ -324,6 +410,51 @@ printf '%s\\n' "$private" | "$WG" pubkey
                     write_peer(runner, before=snapshot.text, after=snapshot.config.render(snapshot.config.peers + [peer]), table_before=snapshot.table_text, table_after=json.dumps(table, ensure_ascii=False), interface=Path(server.config_path).stem, key=public, allowed_ips=address, psk=psk)
                 finally:
                     self.cache.pop(sid, None)
+                self._read(sid)
+                return self.store.client(sid, cid)
+            return await self.worker(operation)
+
+    @audited('client.rename')
+    async def rename_client(self, sid: int, cid: int, name: str) -> dict:
+        """Changes only the name in clientsTable (where AmneziaVPN reads it too).
+
+        The VPN config and the running interface stay untouched: no "wg set", so the
+        obfuscation parameters and active connections are not affected."""
+        name = validate_name(name)
+        async with self.lock(sid):
+            def operation():
+                snapshot = self._read(sid)
+                client = self.store.client(sid, cid)
+                key = client["public_key"]
+                saved = self.paused(sid)
+                present = any(p.public_key == key for p in snapshot.config.peers)
+                if not present and key not in saved:
+                    raise ManagerError("Клиент больше не существует на сервере.")
+                taken = [p.name for p in snapshot.config.peers if p.public_key != key]
+                taken += [item["name"] for other, item in saved.items() if other != key]
+                if any(other.casefold() == name.casefold() for other in taken):
+                    raise ManagerError("Клиент с таким именем на этом сервере уже есть.")
+                current = next((p.name for p in snapshot.config.peers if p.public_key == key), None)
+                if current is None:
+                    current = saved[key]["name"]
+                if current == name:
+                    return self.store.client(sid, cid)
+                table = [dict(entry, userData=dict(entry["userData"])) for entry in snapshot.table]
+                entry = next((item for item in table if item["clientId"] == key), None)
+                if entry is None:
+                    table.append({"clientId": key, "userData": {"clientName": name}})
+                else:
+                    entry["userData"]["clientName"] = name
+                try:
+                    write_peer(self.runner(sid), before=snapshot.text, after=snapshot.text,
+                               table_before=snapshot.table_text, table_after=json.dumps(table, ensure_ascii=False),
+                               interface=Path(self.store.server(sid).config_path).stem, key=key,
+                               allowed_ips="", psk="", table_only=True)
+                finally:
+                    self.cache.pop(sid, None)
+                if key in saved:
+                    saved[key]["name"] = name
+                    self.store.set_pref(f'paused_clients:{sid}', saved)
                 self._read(sid)
                 return self.store.client(sid, cid)
             return await self.worker(operation)
@@ -503,6 +634,11 @@ printf '%s\\n' "$private" | "$WG" pubkey
         for sid, result in results.items():
             if isinstance(result, ManagerError):
                 continue
+            if sid not in self.traffic_refreshed:
+                try:
+                    await self.refresh_service_traffic(sid)
+                except Exception as exc:  # limits below must still be enforced
+                    log.warning("Не удалось обновить сборщик трафика: server=%d %s", sid, type(exc).__name__)
             for client in self.store.clients(sid):
                 expired = client["expires"] is not None and client["expires"] <= time.time()
                 used = client["total_rx"] + client["total_tx"]

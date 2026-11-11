@@ -5,7 +5,7 @@ import sqlite3
 from tempfile import TemporaryDirectory
 import unittest
 
-from scripts.service_traffic import aggregate, category, flush, peer_addresses, peer_id, prepare, report
+from scripts.service_traffic import Continuations, aggregate, category, flush, peer_addresses, peer_id, prepare, report
 
 
 class ServiceTrafficTests(unittest.TestCase):
@@ -40,6 +40,35 @@ class ServiceTrafficTests(unittest.TestCase):
         self.assertEqual(category("TLS.OtherService", "", 6, "Streaming"), "group_entertainment")
         self.assertEqual(category("TLS.OtherService", "", 6, "SoftwareUpdate"), "group_updates")
         self.assertEqual(category("TLS", "", 1, "Music"), "unknown")
+
+    def test_pieces_of_a_long_connection_keep_the_service(self):
+        # NFStream cuts a connection every two minutes; later pieces have no server name and
+        # may start with a server packet, so the ends come swapped.
+        pieces = Continuations()
+        client, server = ("10.8.1.7", 51000), ("142.250.74.110", 443)
+        self.assertEqual(pieces.label(6, *client, *server, 0, 119_000, True, "youtube"), "youtube")
+        self.assertEqual(pieces.label(6, *server, *client, 120_000, 239_000, True, "unknown"), "youtube")
+        self.assertEqual(pieces.label(6, *server, *client, 240_000, 300_000, False, "unknown"), "youtube")
+        # The connection has ended: the same ports later are a new connection.
+        self.assertEqual(pieces.label(6, *client, *server, 301_000, 302_000, False, "unknown"), "unknown")
+        self.assertEqual(pieces.known, {})
+
+    def test_unrelated_or_late_pieces_do_not_inherit(self):
+        pieces = Continuations()
+        client, server = ("10.8.1.7", 51000), ("142.250.74.110", 443)
+        pieces.label(6, *client, *server, 0, 119_000, True, "youtube")
+        self.assertEqual(pieces.label(17, *client, *server, 120_000, 130_000, False, "unknown"), "unknown")
+        self.assertEqual(pieces.label(6, "10.8.1.8", 51000, *server, 120_000, 130_000, False, "unknown"), "unknown")
+        self.assertEqual(pieces.label(6, *client, *server, 119_000 + Continuations.GAP_MS + 1, 200_000, False, "unknown"), "unknown")
+        # An unidentified first piece does not mask what a later piece recognises.
+        pieces.label(6, *client, *server, 0, 119_000, True, "unknown")
+        self.assertEqual(pieces.label(6, *client, *server, 120_000, 130_000, False, "web"), "web")
+
+    def test_continuation_memory_is_bounded(self):
+        pieces = Continuations(limit=4)
+        for port in range(10):
+            pieces.label(6, "10.8.1.7", port, "1.1.1.1", 443, 0, port * 60_000, True, "web")
+        self.assertLessEqual(len(pieces.known), 4)
 
     def test_peer_scope_direction_period_and_staleness(self):
         first, second = "A" * 43 + "=", "B" * 43 + "="

@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import json
@@ -11,7 +12,7 @@ from urllib.parse import urlencode
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
-from manager.domain import Peer, Server
+from manager.domain import ManagerError, Peer, Server
 from manager.store import Store
 from manager.web import MiniApp, create_web_app, validate_init_data
 
@@ -267,6 +268,36 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status,400)
         self.assertEqual(self.service.reissue_client.await_count,1)
 
+    async def test_policy_stores_and_applies_speed_limit(self):
+        self.service.lock=lambda sid:asyncio.Lock()
+        self.service.apply_speed=AsyncMock()
+        path=f'/api/servers/{self.server.id}/clients/1/policy'
+        response=await self.client.patch(path,headers=self.headers,json={'speed':25,'limit':None,'duration':None});self.assertEqual(response.status,200)
+        self.assertEqual(self.store.client(self.server.id,1)['speed_limit'],25)
+        self.service.apply_speed.assert_awaited_once_with(self.server.id)
+        for bad in (0,-5,10001,2.5,'fast'):
+            response=await self.client.patch(path,headers=self.headers,json={'speed':bad});self.assertEqual(response.status,400,bad)
+        self.assertEqual(self.store.client(self.server.id,1)['speed_limit'],25)
+        response=await self.client.patch(path,headers=self.headers,json={});self.assertEqual(response.status,200)
+        self.assertIsNone(self.store.client(self.server.id,1)['speed_limit'])
+
+    async def test_config_file_is_sent_to_chat_in_chosen_format(self):
+        conf='[Interface]\nAddress = 10.0.0.2/32\nPrivateKey = x\nJc = 4\n\n[Peer]\nPublicKey = y\nEndpoint = 203.0.113.5:443\n'
+        with self.store.transaction() as db:db.execute('UPDATE clients SET config=? WHERE id=1',(conf,))
+        response=await self.client.get(f'/api/servers/{self.server.id}/clients/1/config',headers=self.headers)
+        from manager.amnezia_key import decode
+        body=await response.json();self.assertEqual(body['config'],conf)
+        self.assertEqual(decode(body['vpn'])['description'],'test')
+        path=f'/api/servers/{self.server.id}/clients/1/config/send'
+        response=await self.client.post(path,json={'format':'conf'});self.assertEqual(response.status,401)
+        response=await self.client.post(path,headers=self.headers,json={'format':'zip'});self.assertEqual(response.status,400)
+        self.bot.send_document.assert_not_awaited()
+        for kind,suffix in (('conf','.conf'),('vpn','.vpn')):
+            self.bot.send_document.reset_mock()
+            response=await self.client.post(path,headers=self.headers,json={'format':kind});self.assertEqual(response.status,200)
+            self.bot.send_document.assert_awaited_once()
+            self.assertTrue(self.bot.send_document.await_args.args[1].filename.endswith(suffix))
+
     async def test_preferences_authenticated_persisted_and_normalized(self):
         response=await self.client.post('/api/preferences',json={'palette':'pink'})
         self.assertEqual(response.status,401)
@@ -356,3 +387,26 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((day['rx'],day['tx']),(80,20))
         response=await self.client.get(f'/api/servers/{self.server.id}/daily?month=bad',headers=self.headers)
         self.assertEqual(response.status,400)
+
+    async def test_client_form_renames_and_keeps_only_the_comment(self):
+        sid=self.server.id;cid=self.store.clients(sid)[0]['id'];url=f'/api/servers/{sid}/clients/{cid}/labels'
+        self.store.set_pref(f'client_labels:{sid}:{cid}',{'owner':'Иван','device':'iPhone','group':'Семья','note':'старый'})
+        async def rename(s,c,name):
+            with self.store.transaction() as db:db.execute('UPDATE clients SET name=? WHERE id=?',(name.strip(),c))
+            return self.store.client(s,c)
+        self.service.rename_client=AsyncMock(side_effect=rename)
+        response=await self.client.patch(url,headers=self.headers,json={'name':'client','note':' без смены имени '})
+        self.assertEqual(await response.json(),{'note':'без смены имени','name':'client'})
+        self.service.rename_client.assert_not_awaited()
+        self.assertEqual(self.store.get_pref(f'client_labels:{sid}:{cid}'),{'note':'без смены имени'})
+        response=await self.client.patch(url,headers=self.headers,json={'name':'Ноутбук','note':''})
+        self.assertEqual(await response.json(),{'note':'','name':'Ноутбук'})
+        self.service.rename_client.assert_awaited_once_with(sid,cid,'Ноутбук')
+        response=await self.client.patch(url,headers=self.headers,json={'name':'x','note':'a'*251})
+        self.assertEqual(response.status,400)
+        self.assertEqual(self.service.rename_client.await_count,1)
+        self.service.rename_client=AsyncMock(side_effect=ManagerError('Клиент с таким именем на этом сервере уже есть.'))
+        response=await self.client.patch(url,headers=self.headers,json={'name':'Другой','note':'новый'})
+        self.assertEqual(response.status,400)
+        self.assertIn('уже есть',(await response.json())['error'])
+        self.assertEqual(self.store.get_pref(f'client_labels:{sid}:{cid}'),{'note':''})

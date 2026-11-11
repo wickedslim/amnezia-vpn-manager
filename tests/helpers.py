@@ -23,7 +23,7 @@ def fixture(root: Path, names=("office401", "office401")):
     root.mkdir(parents=True, exist_ok=True)
     private, public = keypair()
     config = f"[Interface]\nPrivateKey = {private}\nAddress = 10.30.0.1/24\nListenPort = 51820\nJc = 4\nS3 = 25\nI1 = <b 0x00>\n"
-    runtime = {"public": public, "peers": {}}
+    runtime = {"public": public, "peers": {}, "params": {"jc": "4", "s3": "25", "i1": "<b 0x00>"}}
     table = []
     for i, name in enumerate(names, 2):
         _, peer = keypair()
@@ -67,14 +67,19 @@ elif args[0] == "set":
     if (root / "fail_once").exists():
         (root / "fail_once").unlink()
         sys.exit(2)
-    key = args[3]
-    if args[4] != "remove" and (root / "fail_add_once").exists():
-        (root / "fail_add_once").unlink()
-        sys.exit(2)
-    if args[4] == "remove":
-        state["peers"].pop(key, None)
-    else:
-        state["peers"][key] = {"psk": Path(args[5]).read_text(), "ips": args[7], "rx":0,"tx":0,"handshake":0}
+    # Like AmneziaWG, every runtime change resets obfuscation parameters unless they are passed along.
+    at = args.index("peer") if "peer" in args else len(args)
+    state["params"] = {args[i]: args[i + 1] for i in range(2, at, 2)}
+    if at < len(args):
+        o = at - 2
+        key = args[3 + o]
+        if args[4 + o] != "remove" and (root / "fail_add_once").exists():
+            (root / "fail_add_once").unlink()
+            sys.exit(2)
+        if args[4 + o] == "remove":
+            state["peers"].pop(key, None)
+        else:
+            state["peers"][key] = {"psk": Path(args[5 + o]).read_text(), "ips": args[7 + o], "rx":0,"tx":0,"handshake":0}
     (root / "runtime.json").write_text(json.dumps(state))
 elif args[0] == "addconf":
     values = {}
@@ -83,6 +88,7 @@ elif args[0] == "addconf":
             k,v = line.split("=",1)
             values[k.strip()] = v.strip()
     state["peers"][values["PublicKey"]] = {"ips":values["AllowedIPs"],"psk":values.get("PresharedKey","(none)"),"rx":0,"tx":0,"handshake":0}
+    state["params"] = {}
     (root / "runtime.json").write_text(json.dumps(state))
 else:
     sys.exit(3)

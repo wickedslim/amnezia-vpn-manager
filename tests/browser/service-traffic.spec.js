@@ -53,8 +53,8 @@ test('owner opens server and client traffic reports and switches the period', as
   await expect(open).toBeFocused();
 
   await page.goto('/#/client/1/9');
-  const labels = await page.getByRole('button', {name: 'Описание клиента'}).boundingBox();
-  const pause = await page.getByRole('button', {name: 'Приостановить доступ'}).boundingBox();
+  const labels = await page.getByRole('button', {name: 'Имя и комментарий'}).boundingBox();
+  const pause = await page.getByRole('button', {name: 'Доступ и ограничения'}).boundingBox();
   expect(pause.y - labels.y - labels.height).toBeGreaterThanOrEqual(8);
   const clientReport = page.waitForResponse(response =>
     response.url().endsWith('/servers/1/clients/9/service-traffic?window=day') && response.ok());
@@ -62,6 +62,20 @@ test('owner opens server and client traffic reports and switches the period', as
   await clientReport;
   await dialog.getByText('Мессенджеры и звонки', {exact: true}).click();
   await expect(dialog.getByText('Telegram', {exact: true})).toBeVisible();
+});
+
+test('daily statistics screen offers the same service traffic card as the client screen', async ({page}) => {
+  await page.setViewportSize({width: 320, height: 740});
+  await page.goto('/#/daily/1/9');
+  const open = page.getByRole('button', {name: 'Трафик по сервисам', exact: true});
+  await expect(page.getByRole('heading', {name: 'Сравнение трафика'})).toBeVisible();
+  await expect(open).toBeVisible();
+  const report = page.waitForResponse(response =>
+    response.url().endsWith('/servers/1/clients/9/service-traffic?window=day') && response.ok());
+  await open.click();
+  await report;
+  const dialog = page.getByRole('dialog', {name: 'Трафик по сервисам'});
+  await expect(dialog.getByText('Мессенджеры и звонки', {exact: true})).toBeVisible();
 });
 
 test('traffic settings toggle each installed collector independently', async ({page}) => {

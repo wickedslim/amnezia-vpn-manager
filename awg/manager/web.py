@@ -66,7 +66,7 @@ def client_json(c):
                 handshake=c['handshake'], online=bool(c['handshake'] and 0 <= time.time()-c['handshake'] <= 180),
                 last_handshake=max(c['handshake'], c.get('last_handshake', 0)),
                 has_history=bool(c['handshake'] or c.get('last_handshake') or c['total_rx'] or c['total_tx']),
-                limit=c['traffic_limit'], expires=c['expires'], has_config=bool(c['config']))
+                limit=c['traffic_limit'], speed=c.get('speed_limit'), expires=c['expires'], has_config=bool(c['config']))
 
 
 def policy(body):
@@ -78,6 +78,15 @@ def policy(body):
             raise ManagerError('Укажите положительный срок и лимит или оставьте их пустыми.')
         return int(value)
     return number('duration', 10*365*86400), number('limit', 1024**4*1024)
+
+
+def speed(body):
+    value = body.get('speed')
+    if value is None:
+        return None
+    if type(value) is not int or not 1 <= value <= 10000:
+        raise ManagerError('Скорость должна быть целым числом от 1 до 10000 Мбит/с или пустой.')
+    return value
 
 
 class MiniApp:
@@ -450,16 +459,21 @@ class MiniApp:
     async def client_labels(self, request):
         sid = int(request.match_info['sid'])
         cid = int(request.match_info['cid'])
-        self.store.client(sid, cid)
+        client = self.store.client(sid, cid)
         body = await request.json()
-        labels = {}
-        for key in ('owner', 'device', 'group', 'note'):
-            value = body.get(key, '')
-            if not isinstance(value, str) or len(value) > (250 if key == 'note' else 64):
-                raise ManagerError('Сократите описание клиента.')
-            labels[key] = value.strip()
+        note = body.get('note', '')
+        if not isinstance(note, str) or len(note) > 250:
+            raise ManagerError('Сократите комментарий до 250 символов.')
+        name = body.get('name')
+        if name is not None:
+            if not isinstance(name, str):
+                raise ManagerError('Введите имя клиента.')
+            if name.strip() != client['name']:
+                await self.service.rename_client(sid, cid, name)
+        # The description is now just a comment; owner, device and group are no longer kept.
+        labels = {'note': note.strip()}
         self.store.set_pref(f'client_labels:{sid}:{cid}', labels)
-        return web.json_response(labels)
+        return web.json_response({**labels, 'name': self.store.client(sid, cid)['name']})
 
     async def service_traffic_control(self, request):
         self.require_owner(request["uid"])
@@ -522,10 +536,16 @@ class MiniApp:
     async def create(self, request):
         body = await request.json()
         duration, limit = policy(body)
+        rate = speed(body)
         name = body.get('name')
         if not isinstance(name, str):
             raise ManagerError('Введите имя клиента.')
-        c = await self.service.create_client(int(request.match_info['sid']), name, duration, limit)
+        c = await self.service.create_client(int(request.match_info['sid']), name, duration, limit, rate)
+        if rate:
+            try:
+                await self.service.apply_speed(int(request.match_info['sid']))
+            except ManagerError:
+                log.warning('Ограничение скорости нового клиента не применено: server=%s', request.match_info['sid'])
         self.last_refresh = 0
         return web.json_response(client_json(c), status=201)
 
@@ -547,11 +567,16 @@ class MiniApp:
         sid, cid = int(request.match_info['sid']), int(request.match_info['cid'])
         body = await request.json()
         duration, limit = policy(body)
+        rate = speed(body)
         # Serialise with monitor/client deletion, using the same service lock.
         async with self.service.lock(sid):
             c = self.store.client(sid, cid)
             expiry = c['expires'] if body.get('keep_expiry') is True else int(time.time())+duration if duration else None
-            self.store.set_policy(sid, cid, expiry, limit)
+            self.store.set_policy(sid, cid, expiry, limit, rate)
+        try:
+            await self.service.apply_speed(sid)
+        except ManagerError as exc:
+            raise ManagerError(f'Ограничения сохранены, но скорость применить не удалось: {exc} Применение повторится автоматически.') from exc
         return web.json_response({'ok': True})
 
     async def prepare_reissue(self, request):
@@ -569,7 +594,41 @@ class MiniApp:
         c = self.store.client(int(request.match_info['sid']), int(request.match_info['cid']))
         if not c['config']:
             raise ManagerError('Приватный ключ этого клиента не сохранён в боте.')
-        return web.json_response({'config': c['config']})
+        from .amnezia_key import vpn_key
+        server = self.store.server(int(request.match_info['sid']))
+        try:
+            key = vpn_key(c['config'], server.name, c['public_key'])
+        except ManagerError:
+            key = None  # an unusual config still opens as text and .conf
+        return web.json_response({'config': c['config'], 'vpn': key})
+
+
+    async def send_config(self, request):
+        sid, cid = int(request.match_info['sid']), int(request.match_info['cid'])
+        body = await request.json()
+        kind = body.get('format') if isinstance(body, dict) else None
+        if kind not in {'conf', 'vpn'}:
+            raise ManagerError('Выберите формат файла.')
+        c = self.store.client(sid, cid)
+        if not c['config']:
+            raise ManagerError('Приватный ключ этого клиента не сохранён в боте.')
+        if self.bot is None:
+            raise ManagerError('Отправка файлов недоступна в демонстрации.')
+        from html import escape
+        from .amnezia_key import vpn_key
+        from aiogram.types import BufferedInputFile
+        name = re.sub(r'[^\w.-]', '_', c['name'])[:40] or str(cid)
+        raw = c['config'].encode()
+        if kind == 'vpn':
+            key = vpn_key(c['config'], self.store.server(sid).name, c['public_key'])
+            document = BufferedInputFile(key.encode(), filename=f'{name}.vpn')
+        else:
+            document = BufferedInputFile(raw, filename=f'{name}.conf')
+        try:
+            await asyncio.wait_for(self.bot.send_document(request['uid'], document, caption=escape(c['name'])), 15)
+        except (TelegramAPIError, asyncio.TimeoutError):
+            raise ManagerError('Не удалось отправить файл. Откройте чат с ботом и нажмите /start.')
+        return web.json_response({'ok': True})
 
 
 def create_web_app(settings, store, service, bot=None):
@@ -695,6 +754,7 @@ def create_web_app(settings, store, service, bot=None):
     app.router.add_delete(r'/api/servers/{sid:\d+}/clients/{cid:\d+}', api.delete)
     app.router.add_patch(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/policy', api.set_policy)
     app.router.add_get(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/config', api.config)
+    app.router.add_post(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/config/send', api.send_config)
     app.router.add_post(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/reissue/prepare', api.prepare_reissue)
     app.router.add_post(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/reissue', api.reissue)
     return app
