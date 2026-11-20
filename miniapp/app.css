@@ -179,7 +179,14 @@ dialog{padding:var(--space-6);scrollbar-gutter:stable;scroll-padding-block:20px}
 dialog label,.form-field{display:block;font-size:calc(13px * var(--text-scale,1));font-weight:600;margin-top:var(--space-4)}
 .form-field>.filter-menu{margin-top:6px;font-weight:400}
 dialog .field{font-size:max(16px,calc(14px * var(--text-scale,1)))}
-/* In a scrollable modal the menu expands in the flow, so its options cannot be clipped. */
+.form-stack{
+  display:grid;
+  grid-template-columns:minmax(0,1fr);
+  gap:var(--space-3);
+}
+#dialog-form .form-stack > *{min-width:0;margin:0}
+#form-error:empty{margin:0}
+/* Show dropdowns above their trigger when there is too little room below. */
 dialog .filter-options{position:absolute;inset:calc(100% + 6px) 0 auto;margin:0;max-height:200px;z-index:30}dialog .filter-menu.opens-up .filter-options{inset:auto 0 calc(100% + 6px)}
 .filter-options{scroll-padding-block:5px}
 .filter-options button{font-size:inherit;line-height:1.4}
@@ -235,6 +242,29 @@ section.service-traffic-row,.traffic-service-details{padding-inline-end:var(--tr
 .traffic-comparison [data-comparison][aria-pressed=false]{background:var(--tg-theme-bg-color);border:1px solid var(--control-border,color-mix(in srgb,var(--tg-theme-hint-color) 35%,transparent))}
 /* A card keeps the same space above and below its content: the last element adds no margin of its own to the card padding. */
 .surface>:last-child{margin-bottom:0}
+.action-card,.action-card-group{display:grid;gap:var(--space-3)}
+.action-card>:is(h2,p,.metric-pair,.speed-activity),
+.action-card-group>p{margin:0}
+.action-card>button+.action-card-group{
+  margin-top:var(--space-1);
+  padding-top:var(--space-4);
+  border-top:1px solid var(--control-border);
+}
+.action-card .secondary{
+  background:var(--tg-theme-bg-color);
+  border:1px solid var(--control-border);
+}
+:root .speedtest-card.action-card{margin-block:var(--section-gap)}
 .search .field{padding-right:44px}.search input::-webkit-search-cancel-button{-webkit-appearance:none;appearance:none}
 .search .search-clear{position:absolute;top:0;right:0;width:44px;height:44px;padding:0;display:grid;place-items:center;background:transparent;border-radius:var(--control-radius,12px);color:var(--tg-theme-hint-color)}.search .search-clear svg{position:static;width:18px;height:18px}
 .search .field,.month-switcher-date>input{font-size:max(16px,calc(14px * var(--text-scale,1)))}
+
+#modal label.endpoint-domain-choice{display:flex;align-items:center;gap:10px;min-height:44px;margin:0}
+.endpoint-domain-choice input{width:18px;height:18px;flex:none}
+#client-endpoint-picker:empty,#client-endpoint-picker>[data-endpoint-options]:empty{display:none}
+.config-qr{display:block;width:min(100%,360px);height:auto;margin-inline:auto;image-rendering:pixelated}
+.delivery-address-list,.delivery-address-row{display:grid;gap:var(--space-3);min-width:0}
+.delivery-address-row{margin:0;padding:var(--space-3);border:1px solid var(--control-border);border-radius:var(--control-radius)}
+.delivery-address-row>legend{padding-inline:var(--space-1)}
+#modal .delivery-address-row label{margin:0}
+#modal .delivery-address-row .toolbar{margin-top:0}

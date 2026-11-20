@@ -98,6 +98,9 @@ fi
 mv -- "$TARGET" "$BACKUP/installation"
 mv -- "$UNIT" "$BACKUP/manager.service"
 if [[ -d "$DROPINS" ]]; then mv -- "$DROPINS" "$BACKUP/drop-ins"; fi
+for link in /usr/local/bin/awg-move /usr/local/bin/awg-vpn; do
+    if [[ -L "$link" && "$(readlink "$link")" == "$TARGET/"* ]]; then rm -f -- "$link"; fi
+done
 systemctl daemon-reload
 trap - ERR INT TERM
 echo "Менеджер удалён. Резервная копия: $BACKUP"

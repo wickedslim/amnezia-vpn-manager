@@ -80,10 +80,13 @@ def client_text(server_name: str, client: dict) -> str:
     end = client["expires"]
     remaining = "Без срока" if end is None else (f"Осталось {max(0, int((end-time.time()) / 3600))} ч" if end > time.time() else "Срок истёк")
     expiry = "" if end is None else f"\nДо {datetime.fromtimestamp(end, timezone.utc):%d.%m.%Y %H:%M} UTC"
+    delivery_address = client.get('config_endpoint')
+    delivery_line = f"Адрес в конфиге: <code>{e(delivery_address)}</code>\n\n" if delivery_address else ""
     return (
         f"<b>{e(client['name'])}</b>\n{e(server_name)} › Клиенты\n\n"
         f"{icon} {status}\nПоследнее соединение: {last_seen}\n"
         f"VPN-адрес: <code>{e(client['allowed_ips'] or '—')}</code>\n\n"
+        f"{delivery_line}"
         f"<b>Трафик клиента · накопительный</b>\n↓ На устройство {size(client['total_tx'])}\n"
         f"↑ С устройства {size(client['total_rx'])}\nВсего: <b>{size(used)}</b>\n\n"
         f"С начала учёта, включая начальные счётчики VPN.\n\n<b>Лимит</b>\n{progress(used, client['traffic_limit'])}\n\n"

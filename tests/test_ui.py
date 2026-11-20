@@ -11,6 +11,25 @@ from manager.ui import AccessMiddleware, UI
 
 
 class UITests(unittest.IsolatedAsyncioTestCase):
+    async def test_new_client_wizard_keeps_selected_address_until_save(self):
+        from manager.endpoints import configure_endpoints
+        server = self.store.add_server(Server(0, 'test', endpoint='203.0.113.10'))
+        self.store.update_server(configure_endpoints(server, [
+            {'label':'Основной','address':'203.0.113.10'},
+            {'label':'Для МТС','address':'203.0.113.11'},
+        ], server.endpoint))
+        await self.ui.begin({'kind':'client','sid':server.id,'step':'name'})
+        await self.ui.message(self.message('Тест клиента'))
+        wizard = self.store.wizard(123)
+        self.assertEqual(wizard['step'],'delivery')
+        buttons = self.bot.edit_message_text.call_args.kwargs['reply_markup'].inline_keyboard
+        self.assertTrue(any('Для МТС' in row[0].text for row in buttons))
+        self.service.create_client = AsyncMock(return_value={'id':1})
+        self.ui.client = AsyncMock()
+        for action in ('delivery=1','duration=none','limit=none','save'):
+            await self.ui.wizard_action(['w',wizard['nonce'],action])
+        self.service.create_client.assert_awaited_once_with(server.id,'Тест клиента',None,None,endpoint='203.0.113.11')
+
     async def asyncSetUp(self):
         self.tmp = TemporaryDirectory()
         self.store = Store(Path(self.tmp.name))

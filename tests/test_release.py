@@ -9,9 +9,11 @@ class ReleaseTests(unittest.TestCase):
             (root/'awg/manager').mkdir(parents=True);(root/'awg/manager/app.py').write_text('pass\n')
             (root/'awg/bot_manager.py').write_text('pass\n');(root/'awg/files').mkdir();(root/'awg/files/setting.ini').write_text('SECRET_TOKEN')
             (root/'DEPLOYMENT.local.md').write_text('SECRET_HOST');(root/'random.md').write_text('PRIVATE_NOTES')
+            (root/'MOVE.ru.md').write_text('Migration instructions')
             archive,info=builder.build(root,Path(d)/'out');first=archive.read_bytes();builder.build(root,Path(d)/'out');self.assertEqual(first,archive.read_bytes())
             with zipfile.ZipFile(archive) as z:
                 self.assertNotIn('awg/files/setting.ini',z.namelist());self.assertNotIn('DEPLOYMENT.local.md',z.namelist());self.assertNotIn('random.md',z.namelist())
+                self.assertIn('MOVE.ru.md', z.namelist())
                 self.assertEqual(json.loads(z.read('BUILD.json'))['id'],info['id'])
                 for line in z.read('SHA256SUMS').decode().splitlines():
                     digest,name=line.split('  ',1);self.assertEqual(hashlib.sha256(z.read(name)).hexdigest(),digest)

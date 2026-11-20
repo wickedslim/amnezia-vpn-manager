@@ -9,10 +9,13 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from collections import Counter
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from pathlib import Path
 
 from .domain import ManagerError, Peer, Server
+from .endpoints import config_endpoint
+
+SERVER_FIELDS = {item.name for item in fields(Server)} - {"id"}
 
 
 class Store:
@@ -60,6 +63,11 @@ class Store:
         if "last_handshake" not in columns:
             self.connection.execute("ALTER TABLE clients ADD COLUMN last_handshake INTEGER NOT NULL DEFAULT 0")
             self.connection.execute("UPDATE clients SET last_handshake=handshake")
+        if "config_endpoint" not in columns:
+            self.connection.execute("ALTER TABLE clients ADD COLUMN config_endpoint TEXT NOT NULL DEFAULT ''")
+            saved = self.connection.execute("SELECT id,config FROM clients WHERE config IS NOT NULL").fetchall()
+            self.connection.executemany("UPDATE clients SET config_endpoint=? WHERE id=?",
+                                        [(config_endpoint(row['config']), row['id']) for row in saved])
         self.connection.execute("INSERT OR IGNORE INTO preferences VALUES (?,?)", ("monthly_since", json.dumps(int(time.time()))))
         self.connection.execute("INSERT OR IGNORE INTO preferences VALUES (?,?)", ("daily_since", json.dumps(int(time.time()))))
         self.connection.commit()
@@ -106,8 +114,13 @@ class Store:
 
     def servers(self) -> list[Server]:
         with self.lock:
-            rows = self.connection.execute("SELECT id,config FROM servers ORDER BY name COLLATE NOCASE").fetchall()
-        return [Server(**{**json.loads(r["config"]), "id": r["id"]}) for r in rows]
+            rows = self.connection.execute("SELECT id,name,config FROM servers ORDER BY name COLLATE NOCASE").fetchall()
+        servers = []
+        for row in rows:
+            data = {key: value for key, value in json.loads(row["config"]).items() if key in SERVER_FIELDS}
+            data.setdefault("name", row["name"])
+            servers.append(Server(id=row["id"], **data))
+        return servers
 
     def server(self, sid: int) -> Server:
         return next((s for s in self.servers() if s.id == sid), None) or self._missing("Сервер больше не подключён. Откройте главную.")
@@ -204,14 +217,16 @@ class Store:
             for item in pending:
                 old, new = item['old_key'] in keys, item['new_key'] in keys
                 if new and not old:
-                    conn.execute('UPDATE clients SET public_key=?,config=?,last_rx=0,last_tx=0,handshake=0,endpoint=? WHERE id=?', (item['new_key'], item['config'], '', item['client_id']))
+                    conn.execute('UPDATE clients SET public_key=?,config=?,config_endpoint=?,last_rx=0,last_tx=0,handshake=0,endpoint=? WHERE id=?',
+                                 (item['new_key'], item['config'], config_endpoint(item['config']), '', item['client_id']))
                 elif not old or new:
                     raise ManagerError('Не удалось однозначно проверить перевыпуск. Обновите связь с сервером; повторный перевыпуск пока остановлен.')
                 conn.execute('DELETE FROM rotations WHERE client_id=?', (item['client_id'],))
 
     def save_client_config(self, sid: int, key: str, config: str):
         with self.transaction() as conn:
-            conn.execute("UPDATE clients SET config=? WHERE server_id=? AND public_key=?", (config, sid, key))
+            conn.execute("UPDATE clients SET config=?,config_endpoint=? WHERE server_id=? AND public_key=?",
+                         (config, config_endpoint(config), sid, key))
 
     def sync(self, sid: int, peers: list[Peer], server_public: str):
         from .domain import fields
@@ -241,7 +256,8 @@ class Store:
                     conn.execute("INSERT INTO daily VALUES (?,?,?,?) ON CONFLICT(client_id,day) DO UPDATE SET rx=rx+excluded.rx,tx=tx+excluded.tx", (cid, day, monthly_rx, monthly_tx))
                 imported = conn.execute("SELECT config FROM legacy_configs WHERE public_key=?", (p.public_key,)).fetchone()
                 if imported and fields(imported[0].split("[Peer]", 1)[-1]).get("PublicKey") == server_public:
-                    conn.execute("UPDATE clients SET config=COALESCE(config,?) WHERE server_id=? AND public_key=?", (imported[0], sid, p.public_key))
+                    conn.execute("UPDATE clients SET config=?,config_endpoint=? WHERE server_id=? AND public_key=? AND config IS NULL",
+                                 (imported[0], config_endpoint(imported[0]), sid, p.public_key))
                 if p.endpoint:
                     cid = conn.execute("SELECT id FROM clients WHERE server_id=? AND public_key=?", (sid, p.public_key)).fetchone()[0]
                     conn.execute("INSERT OR REPLACE INTO connections VALUES (?,?,?)", (cid, p.endpoint, p.handshake or now))

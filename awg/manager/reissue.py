@@ -3,6 +3,7 @@ import hmac
 import secrets
 import time
 from .domain import ManagerError
+from .endpoints import config_host
 
 
 class Reissues:
@@ -14,11 +15,13 @@ class Reissues:
         client = self.store.client(sid, cid)
         token = secrets.token_urlsafe(12)
         self.pending[(sid, cid)] = (token, time.monotonic() + 120, client['public_key'])
-        return {'nonce': token, 'name': client['name'], 'server': self.store.server(sid).name}
+        return {'nonce': token, 'name': client['name'], 'server': self.store.server(sid).name,
+                'endpoint': config_host(client['config'])}
 
-    async def execute(self, sid, cid, token):
+    async def execute(self, sid, cid, token, endpoint=None):
         expected = self.pending.get((sid, cid))
         if not expected or not isinstance(token, str) or not hmac.compare_digest(expected[0], token) or time.monotonic() > expected[1]:
             raise ManagerError('Подтверждение истекло или уже использовано. Откройте карточку и повторите действие.')
         self.pending.pop((sid, cid), None)
-        return await self.service.reissue_client(sid, cid, expected[2])
+        options = {'endpoint': endpoint} if endpoint is not None else {}
+        return await self.service.reissue_client(sid, cid, expected[2], **options)

@@ -13,7 +13,9 @@ from types import SimpleNamespace
 from aiohttp import web
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'awg'))
-from manager.domain import Peer, Server
+from manager.domain import ManagerError, Peer, Server
+from manager.endpoints import choose_endpoint, config_host, configure_endpoints, replace_config_endpoint
+from manager.move import move_target
 from manager.store import Store
 from manager.web import create_web_app
 
@@ -22,11 +24,18 @@ def create_demo():
     directory = tempfile.TemporaryDirectory(prefix='amnezia-miniapp-demo-')
     store = Store(Path(directory.name))
     for index,name in enumerate(('serv.host', 'Skystark_awg'),1):
-        s = store.add_server(Server(0, name, host=f'192.0.2.{index}'))
+        s = store.add_server(Server(0, name, host=f'192.0.2.{index}', endpoint=f'192.0.2.{index}', local=index == 1))
+        if index == 1:
+            store.update_server(configure_endpoints(s, [
+                {'label':'Основной', 'address':'vpn.example.com'},
+                {'label':'По IP', 'address':s.endpoint}, {'label':'Для МТС', 'address':'198.51.100.20'},
+            ], 'vpn.example.com'))
         now = int(time.time())
         names = ['Admin · MacBook', 'Admin · iPhone', 'Kolida1', 'Kolida2', 'myRouter', 'office401', 'Склад', 'Дом', 'Длинное имя клиента для проверки переноса']
         peers = [Peer(f'demo-key-{i}', name, f'10.8.{s.id}.{i+2}/32', '', handshake=now-20 if i%3 else now-7200, received=(i+1)*144_000_000, sent=(i+1)*281_000_000) for i,name in enumerate(names[:9 if s.id==1 else 5])]
         store.sync(s.id, peers, 'demo-public')
+        if index == 1:
+            store.save_client_config(s.id, peers[0].public_key, f'# ДЕМО\n[Peer]\nEndpoint = {s.endpoint}:42080\n')
         store.set_pref(f'hosttraffic:{s.id}',dict(rx=132_000_000_000,tx=167_000_000_000,since=now-11*86400,updated=now,interface='eth0',boot='demo',last_rx=132_000_000_000,last_tx=167_000_000_000))
         with store.transaction() as c:
             month = datetime.now(ZoneInfo('Europe/Samara')).strftime('%Y-%m')
@@ -127,9 +136,10 @@ def create_demo():
         async def probe(self,server):
             if not server.host.endswith('.example'):raise ValueError('Demo accepts .example hosts only')
         async def apply_speed(self,sid):return None
-        async def create_client(self,sid,name,duration,limit,speed=None):
+        async def create_client(self,sid,name,duration,limit,speed=None,*,endpoint=None):
             from manager.domain import validate_name,ManagerError
             validate_name(name)
+            address = choose_endpoint(store.server(sid), endpoint)
             if any(c['name']==name for c in store.clients(sid)):raise ManagerError('Клиент с таким именем уже есть.')
             existing=store.clients(sid)
             peers=[Peer(c['public_key'],c['name'],c['allowed_ips'],'',handshake=c['handshake'],received=c['last_rx'] or 0,sent=c['last_tx'] or 0) for c in existing]
@@ -138,6 +148,8 @@ def create_demo():
             store.sync(sid,peers,'demo-public')
             c=next(c for c in store.clients(sid) if c['public_key']==key)
             store.set_policy(sid,c['id'],int(time.time())+duration if duration else None,limit,speed)
+            host = f'[{address}]' if ':' in address else address
+            store.save_client_config(sid, key, f'# ДЕМО\n[Peer]\nEndpoint = {host}:42080\n')
             return store.client(sid,c['id'])
         async def rename_client(self,sid,cid,name):
             from manager.domain import validate_name,ManagerError
@@ -151,12 +163,22 @@ def create_demo():
             if pause:saved[c['public_key']]={'name':c['name']}
             else:saved.pop(c['public_key'],None)
             store.set_pref(f'paused_clients:{sid}',saved)
-        async def reissue_client(self,sid,cid,expected_key):
+        async def reissue_client(self,sid,cid,expected_key,*,endpoint=None):
             from manager.domain import ManagerError
             c=store.client(sid,cid)
             if c['public_key']!=expected_key:raise ManagerError('Конфиг уже изменился. Откройте карточку заново.')
-            config='# ДЕМОНСТРАЦИОННЫЙ ФАЙЛ: не подключается к VPN\n# '+c['name']+'\n'
-            with store.transaction() as db:db.execute('UPDATE clients SET config=?,public_key=? WHERE id=?',(config,f'demo-rotated-{time.time_ns()}',cid))
+            address = choose_endpoint(store.server(sid), endpoint, config_host(c['config']))
+            host = f'[{address}]' if ':' in address else address
+            config = f'# ДЕМО\n[Peer]\nEndpoint = {host}:42080\n'
+            key = f'demo-rotated-{time.time_ns()}'
+            with store.transaction() as db:
+                db.execute('UPDATE clients SET public_key=? WHERE id=?',(key,cid))
+                store.save_client_config(sid,key,config)
+            return store.client(sid,cid)
+        async def change_client_endpoint(self,sid,cid,endpoint):
+            c = store.client(sid,cid)
+            address = choose_endpoint(store.server(sid), endpoint)
+            store.save_client_config(sid,c['public_key'],replace_config_endpoint(c['config'],address))
             return store.client(sid,cid)
         async def delete_client(self,sid,cid):
             store.client(sid,cid)
@@ -166,8 +188,21 @@ def create_demo():
     import hashlib,hmac,json
     from urllib.parse import urlencode
     update_demo={'phase':'idle','enabled':True}
+    move_demo = {}
     @web.middleware
     async def demo(request,handler):
+        if request.method == 'POST' and request.path == '/api/servers/1/move/prepare':
+            body = await request.json()
+            try:
+                target = move_target(body.get('host'), body.get('port'))
+            except ManagerError as error:
+                return web.json_response({'error': str(error)}, status=400)
+            move_demo['target'] = target
+            return web.json_response({'nonce': 'DEMO_MOVE', 'target': target})
+        if request.method == 'POST' and request.path == '/api/servers/1/move':
+            if (await request.json()).get('nonce') != 'DEMO_MOVE' or not move_demo:
+                return web.json_response({'error': 'Проверьте новый VPS ещё раз.'}, status=400)
+            return web.json_response({'target': move_demo.pop('target'), 'scheduled': True}, status=202)
         if request.method == 'POST' and request.path.endswith('/backup'):
             return web.json_response({'sent': True})
         if request.path.startswith('/api/updates'):

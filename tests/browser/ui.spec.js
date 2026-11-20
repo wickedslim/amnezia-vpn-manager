@@ -331,3 +331,226 @@ test('online dots use one colour on every screen and in both themes', async ({pa
     expect([...seen], theme).toEqual(['rgb(32, 231, 122)']);
   }
 });
+
+test('VPN address editor fits narrow screens and keeps keyboard focus clear', async ({page}, testInfo) => {
+  await page.route('**/api/servers/1/endpoint', route => route.fulfill({json: {
+    default: 'vpn.example.com',
+    choices: [
+      {label: 'Основной', address: 'vpn.example.com', mode: 'dns'},
+      {label: 'По IP', address: '192.0.2.1', mode: 'ip'},
+    ],
+  }}));
+  for (const mode of ['light', 'dark']) {
+    await page.route('**/api/preferences', route => route.fulfill({json: {mode, fontSize: 16, density: 'compact', motion: false}}));
+    for (const width of [320, 393, 520]) {
+      await page.setViewportSize({width, height: 852});
+      await page.goto('about:blank');
+      await page.goto('/#/server/1');
+      await page.getByRole('button', {name: 'Адреса VPN'}).click();
+      const dialog = page.getByRole('dialog', {name: 'Адреса VPN'});
+      await expect(page.locator('html')).toHaveAttribute('data-theme', mode);
+      const firstRow = dialog.getByRole('group', {name: 'Адрес подключения'}).first();
+      const address = firstRow.getByRole('textbox', {name: 'IP или домен'});
+      await expect(address).toHaveValue('vpn.example.com');
+      await expect(firstRow.getByRole('radio', {name: 'По умолчанию'})).toBeChecked();
+      await address.press('Tab');
+      const label = firstRow.getByRole('textbox', {name: 'Подпись'});
+      await expect(label).toBeFocused();
+      await expect(label).toHaveCSS('outline-style', 'solid');
+      const fieldBox = await label.boundingBox();
+      const button = firstRow.getByRole('button', {name: 'Убрать адрес'});
+      const buttonBox = await button.boundingBox();
+      expect(buttonBox.y - fieldBox.y - fieldBox.height).toBeGreaterThanOrEqual(12);
+      expect(buttonBox.height).toBeGreaterThanOrEqual(44);
+      expect(await dialog.locator('form').evaluate(form => form.scrollWidth <= form.clientWidth)).toBe(true);
+      if (width === 393) {
+        await dialog.screenshot({path: testInfo.outputPath(`vpn-addresses-${mode}.png`)});
+      }
+      await dialog.getByRole('button', {name: 'Отмена'}).click();
+    }
+    await page.unroute('**/api/preferences');
+  }
+});
+
+test('delivery address follows the selected server and client mode', async ({page}) => {
+  await page.goto('/#/clients');
+  await page.getByRole('button',{name:'Добавить клиента'}).click();
+  const dialog=page.getByRole('dialog',{name:'Новый клиент'});
+  const pick=async (name,value) => {
+    const menu=dialog.locator(`#form-${name}-menu`);
+    await menu.locator('summary').click();
+    await menu.locator(`[data-filter-option="${value}"]`).click();
+  };
+  await pick('server','2');
+  await expect(dialog.getByText('Адрес подключения: 192.0.2.2',{exact:true})).toBeVisible();
+  await expect(dialog.locator('[name=endpoint_mode]')).toHaveCount(0);
+  await expect(dialog.locator('[name=endpoint]')).toHaveValue('192.0.2.2');
+  await pick('server','1');
+  await pick('endpoint_mode','dns');
+  await expect(dialog.locator('[name=endpoint]')).toHaveValue('vpn.example.com');
+  await pick('endpoint_mode','ip');
+  await pick('endpoint','198.51.100.20');
+  await dialog.getByRole('textbox',{name:'Имя'}).fill('Тест выдачи IP');
+  const saved=page.waitForResponse(response=>response.url().endsWith('/api/servers/1/clients') && response.request().method()==='POST');
+  await dialog.getByRole('button',{name:'Создать'}).click();
+  const response=await saved;
+  expect(response.status()).toBe(201);
+  expect((await response.json()).config_endpoint).toBe('198.51.100.20:42080');
+  await expect(dialog).toBeHidden();
+  const config = page.getByRole('dialog', {name: 'Конфиг клиента'});
+  await expect(config.getByRole('textbox')).toHaveValue(/Endpoint = 198\.51\.100\.20:42080/);
+  await expect(config.getByRole('button', {name: 'Поделиться файлом'})).toBeVisible();
+  await expect(page).toHaveURL(/#\/clients$/);
+  await config.getByRole('button', {name: 'Показать QR-код'}).click();
+  const qr = page.getByRole('dialog', {name: 'QR-код конфигурации'});
+  await expect(qr.getByRole('img', {name: 'QR-код конфига AmneziaWG'})).toBeVisible();
+  await qr.getByRole('button', {name: 'К файлам'}).click();
+  await expect(config.getByRole('textbox')).toHaveValue(/Endpoint = 198\.51\.100\.20:42080/);
+});
+
+test('failed client creation preserves the form', async ({page}) => {
+  await page.route('**/api/servers/*/clients', route => route.fulfill({status: 400, json: {error: 'Имя уже занято'}}));
+  await page.goto('/#/clients');
+  await page.getByRole('button', {name: 'Добавить клиента'}).click();
+  const dialog = page.getByRole('dialog', {name: 'Новый клиент'});
+  const name = dialog.getByRole('textbox', {name: 'Имя'});
+  await name.fill('Существующий клиент');
+  await dialog.getByRole('button', {name: 'Создать'}).click();
+  await expect(dialog.getByRole('alert')).toHaveText('Имя уже занято');
+  await expect(name).toHaveValue('Существующий клиент');
+  await expect(page.getByRole('dialog', {name: 'Конфиг клиента'})).toHaveCount(0);
+});
+
+for (const theme of ['light', 'dark']) for (const width of [320, 393, 520]) {
+test(`owner checks a VPS and confirms migration at ${width}px in ${theme}`, async ({page}) => {
+  await page.setViewportSize({width, height: 740});
+  await page.route('**/api/preferences', route => route.fulfill({json: {mode: theme, fontSize: 16, density: 'compact', motion: false}}));
+  await page.goto('/#/server/2');
+  await expect(page.getByRole('heading', {name: 'Управление сервером'})).toBeVisible();
+  await expect(page.getByRole('button', {name: 'Перенос сервера'})).toHaveCount(0);
+  await page.goto('/#/server/1');
+  await page.getByRole('button', {name: 'Перенос сервера'}).click();
+  const form = page.getByRole('dialog', {name: 'Перенос сервера'});
+  const port = form.getByRole('spinbutton', {name: 'SSH-порт'});
+  const host = form.getByRole('textbox', {name: 'IP нового VPS'});
+  await expect(port).toHaveValue('22');
+  await host.fill('203.0.113.10');
+  await host.press('Tab');
+  await expect(port).toBeFocused();
+  await expect(port).toHaveCSS('outline-style', 'solid');
+  expect(await form.locator('form').evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+  await form.getByRole('button', {name: 'Проверить VPS'}).click();
+  const confirmation = page.getByRole('dialog', {name: 'Подтвердить перенос?'});
+  await expect(confirmation).toContainText('203.0.113.10:22');
+  await confirmation.getByRole('button', {name: 'Начать перенос'}).click();
+  await expect(page.getByRole('dialog', {name: 'Перенос запущен'})).toContainText('journalctl -u awg-manager-move -f');
+});
+}
+
+test('saved server addresses and default are available when creating a client', async ({page}) => {
+  await page.goto('/#/server/2');
+  await page.getByRole('button',{name:'Адреса VPN'}).click();
+  const dialog=page.getByRole('dialog',{name:'Адреса VPN'});
+  await expect(dialog.getByRole('button',{name:'Убрать адрес'})).toBeDisabled();
+  await dialog.getByRole('button',{name:'Добавить адрес'}).click();
+  const row=dialog.getByRole('group',{name:'Адрес подключения'}).last();
+  await row.getByRole('textbox',{name:'Подпись'}).fill('Для МТС');
+  await row.getByRole('textbox',{name:'IP или домен'}).fill('198.51.100.21');
+  await row.getByRole('radio',{name:'По умолчанию'}).check();
+  const saved=page.waitForResponse(response=>response.url().endsWith('/api/servers/2/endpoint') && response.request().method()==='PATCH');
+  await dialog.getByRole('button',{name:'Сохранить'}).click();
+  const response=await saved;
+  expect(response.status()).toBe(200);
+  const data=await response.json();
+  expect(data.default).toBe('198.51.100.21');
+  expect(data.choices).toContainEqual({label:'Для МТС',address:'198.51.100.21',mode:'ip'});
+  await expect(dialog).toBeHidden();
+
+  await page.goto('/#/clients');
+  await page.getByRole('button', {name: 'Добавить клиента'}).click();
+  const client = page.getByRole('dialog', {name: 'Новый клиент'});
+  const servers = client.locator('#form-server-menu');
+  await servers.locator('summary').click();
+  await servers.locator('[data-filter-option="2"]').click();
+  const endpoint = client.locator('[name=endpoint]');
+  await expect(endpoint).toHaveValue('198.51.100.21');
+  const addresses = client.locator('#form-endpoint-menu');
+  await addresses.locator('summary').click();
+  await expect(addresses.locator('[data-filter-option="198.51.100.21"]')).toContainText('Для МТС');
+  await addresses.locator('[data-filter-option="192.0.2.2"]').click();
+  await expect(endpoint).toHaveValue('192.0.2.2');
+});
+
+test('changing a client address opens the updated config and its QR', async ({page}) => {
+  await page.goto('/#/client/1/1');
+  await page.getByRole('button',{name:'Сменить адрес',exact:true}).click();
+  const dialog = page.getByRole('dialog',{name:'Сменить адрес'});
+  const mode = dialog.locator('#form-endpoint_mode-menu');
+  await mode.locator('summary').click();
+  await mode.locator('[data-filter-option="dns"]').click();
+  await dialog.getByRole('button',{name:'Сохранить адрес'}).click();
+  const config = page.getByRole('dialog',{name:'Конфиг клиента'});
+  await expect(config.getByRole('textbox')).toHaveValue(/Endpoint = vpn\.example\.com:42080/);
+  await config.getByRole('button',{name:'Показать QR-код'}).click();
+  const image = page.getByRole('img',{name:'QR-код конфига AmneziaWG'});
+  await expect(image).toBeVisible();
+  await expect.poll(()=>image.evaluate(node=>node.naturalWidth)).toBeGreaterThan(0);
+});
+
+for (const {platform, native, label, outcome} of [
+  {platform:'macos', native:true, label:'Поделиться в Telegram', outcome:'sent'},
+  {platform:'macos', native:true, label:'Поделиться в Telegram', outcome:'cancelled'},
+  {platform:'tdesktop', native:false, label:'В чат с ботом', outcome:'fallback'},
+  {platform:'ios', native:true, label:'Поделиться файлом', outcome:'system'},
+]) {
+  test(`config file sharing on ${platform}: ${outcome}`, async ({page}) => {
+    await page.route('https://telegram.org/**', route => route.abort());
+    await page.addInitScript(({platform, native, outcome}) => {
+      window.shareCalls = [];
+      window.Telegram = {WebApp:{
+        platform,
+        isVersionAtLeast: () => native,
+        shareMessage(id, callback) {
+          window.shareCalls.push(id);
+          callback(outcome === 'sent');
+        },
+      }};
+      Object.defineProperty(navigator, 'canShare', {value: () => true});
+      Object.defineProperty(navigator, 'share', {value: async ({files}) => {
+        window.shareCalls.push(files[0].name);
+      }});
+    }, {platform, native, outcome});
+    const requests = [];
+    await page.route('**/clients/1/config/{send,share}', route => {
+      requests.push([route.request().url().split('/').pop(), route.request().postDataJSON().format]);
+      return route.fulfill({json:{ok:true, message_id:'prepared-file'}});
+    });
+    await page.goto('/#/client/1/1');
+    await page.locator('[data-action=config]').click();
+    const dialog = page.getByRole('dialog',{name:'Конфиг клиента'});
+    await dialog.locator('#form-format-menu summary').click();
+    await dialog.locator('[data-filter-option=conf]').click();
+    await dialog.getByRole('button',{name:label,exact:true}).click();
+    const calls = () => page.evaluate(() => window.shareCalls);
+    if (outcome === 'sent' || outcome === 'cancelled') {
+      await expect.poll(calls).toEqual(['prepared-file']);
+      expect(requests).toEqual([['share','conf']]);
+    }
+    if (outcome === 'cancelled') {
+      const fallback = dialog.getByRole('button',{name:'Отправить себе в чат с ботом'});
+      await expect(fallback).toBeEnabled();
+      expect(requests).toEqual([['share','conf']]);
+      await fallback.click();
+    }
+    await expect(dialog).toBeHidden();
+    if (outcome === 'cancelled') expect(requests).toEqual([['share','conf'],['send','conf']]);
+    if (outcome === 'fallback') {
+      expect(await calls()).toEqual([]);
+      expect(requests).toEqual([['send','conf']]);
+    }
+    if (outcome === 'system') {
+      expect(await calls()).toEqual([expect.stringMatching(/\.conf$/)]);
+      expect(requests).toEqual([]);
+    }
+  });
+}

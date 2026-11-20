@@ -2,23 +2,28 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
 import logging
 import math
+import os
 import re
 import secrets
 import time
 from pathlib import Path
 from urllib.parse import parse_qsl
+from urllib.parse import urlsplit
+from .endpoints import delivery, configure, configure_endpoints, endpoint_choices, endpoint_mode
 
 from aiohttp import web
 from aiogram.exceptions import TelegramAPIError
 
 from . import audit
 from .build import build_info
-from .updates import Updates
+from .updates import ACTIVE, Updates
+from .move import Moves
 from .access import Access
 from .domain import Server, validate_name
 from .ui import connection, send_backup
@@ -66,7 +71,13 @@ def client_json(c):
                 handshake=c['handshake'], online=bool(c['handshake'] and 0 <= time.time()-c['handshake'] <= 180),
                 last_handshake=max(c['handshake'], c.get('last_handshake', 0)),
                 has_history=bool(c['handshake'] or c.get('last_handshake') or c['total_rx'] or c['total_tx']),
-                limit=c['traffic_limit'], speed=c.get('speed_limit'), expires=c['expires'], has_config=bool(c['config']))
+                limit=c['traffic_limit'], speed=c.get('speed_limit'), expires=c['expires'], has_config=bool(c['config']),
+                config_endpoint=c.get('config_endpoint', ''))
+
+
+def delivery_choices(server):
+    return {'default': server.endpoint,
+            'choices': [{**row, 'mode': endpoint_mode(row['address'])} for row in endpoint_choices(server)]}
 
 
 def policy(body):
@@ -97,7 +108,10 @@ class MiniApp:
         self.restore_preview = None
         self.resource_since = {}
         self.access = Access(store, settings.admin_id)
-        self.updates = Updates(Path(__file__).resolve().parents[2],build_info()["version"])
+        root = Path(__file__).resolve().parents[2]
+        self.updates = Updates(root, build_info()['version'])
+        self.moves = Moves(root, store)
+        self.maintenance_lock = asyncio.Lock()
         self.server_add_lock = asyncio.Lock()
         self.refresh_lock = asyncio.Lock()
         self.last_refresh = 0.0
@@ -131,9 +145,31 @@ class MiniApp:
         body=await request.json()
         nonce=body.get('nonce')
         if not isinstance(nonce,str) or len(nonce)>100:raise ValueError()
-        try:result=await self.updates.start(nonce)
-        except ValueError as e:raise ManagerError(str(e)) from None
+        async with self.maintenance_lock:
+            if await self.moves.active():
+                raise ManagerError('Дождитесь завершения переноса VPS.')
+            try:result=await self.updates.start(nonce)
+            except ValueError as e:raise ManagerError(str(e)) from None
         return web.json_response(result,status=202)
+
+    async def prepare_move(self, request):
+        self.require_owner(request['uid'])
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ManagerError('Укажите адрес нового VPS.')
+        result = await self.moves.prepare(int(request.match_info['sid']), body.get('host'), body.get('port'))
+        return web.json_response(result)
+
+    async def start_move(self, request):
+        self.require_owner(request['uid'])
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ManagerError('Проверьте новый VPS ещё раз.')
+        async with self.maintenance_lock:
+            if self.updates.status()['phase'] in ACTIVE:
+                raise ManagerError('Дождитесь завершения обновления менеджера.')
+            result = await self.moves.start(int(request.match_info['sid']), body.get('nonce'))
+        return web.json_response(result, status=202)
 
     def require_owner(self,uid):
         if uid!=self.settings.admin_id:
@@ -363,6 +399,38 @@ class MiniApp:
         self.last_refresh=0
         return web.json_response({'id':server.id,'name':server.name},status=201)
 
+    async def endpoint_settings(self, request):
+        self.require_owner(request['uid'])
+        sid = int(request.match_info['sid'])
+        async with self.service.lock(sid):
+            server = self.store.server(sid)
+            if request.method == 'PATCH':
+                body = await request.json()
+                if isinstance(body, dict) and 'endpoints' in body:
+                    server = configure_endpoints(server, body['endpoints'], body.get('default'))
+                else:
+                    updated = configure(server, body)
+                    if server.endpoints:
+                        # The single-address editor updates the preferred IP/DNS while retaining alternatives.
+                        replacements = {value: replacement for value, replacement in
+                                        ((server.endpoint_ip, updated.endpoint_ip), (server.endpoint_dns, updated.endpoint_dns)) if value}
+                        labels = {row['address']: row['label'] for row in server.endpoints}
+                        rows = {}
+                        for row in server.endpoints:
+                            address = replacements.get(row['address'], row['address'])
+                            if address:
+                                rows.setdefault(address, {'label': labels.get(address, row['label']), 'address': address})
+                        for address in (updated.endpoint_ip, updated.endpoint_dns):
+                            if address:
+                                rows.setdefault(address, {'address': address, 'label': ''})
+                        server = configure_endpoints(server, list(rows.values()), updated.endpoint)
+                    else:
+                        server = updated
+                self.store.update_server(server)
+            result = {**delivery(server), **delivery_choices(server)}
+        result['miniapp_domain'] = urlsplit(os.environ.get('AWG_WEB_URL', '')).hostname or ''
+        return web.json_response(result)
+
     def controller(self, request, kind):
         uid=request['uid']
         if uid==self.settings.admin_id:return self.reboots if kind=='reboot' else self.reissues
@@ -434,7 +502,7 @@ class MiniApp:
                 c['labels'] = self.store.get_pref(f"client_labels:{s.id}:{c['id']}", {})
                 c['status_known'] = not unknown
                 if unknown or c['paused']: c['online'] = False
-            servers.append(dict(id=s.id, name=s.name, permissions={operation: self.access.permits(request['uid'], s.id, operation) for operation in ('delete', 'pause', 'reissue', 'reboot')}, ok=reachable, stale=stale, updated=latest['ts'], rx=latest['tx'], tx=latest['rx'],
+            servers.append(dict(id=s.id, name=s.name, delivery=delivery_choices(s), can_move=s.local and request['uid']==self.settings.admin_id, permissions={operation: self.access.permits(request['uid'], s.id, operation) for operation in ('delete', 'pause', 'reissue', 'reboot')}, ok=reachable, stale=stale, updated=latest['ts'], rx=latest['tx'], tx=latest['rx'],
                                 rate_rx=tx if not unknown else 0, rate_tx=rx if not unknown else 0,
                                 online=sum(c['online'] for c in clients), host_traffic=self.hoststats.get(s.id), resources=self.resources.get(s.id), clients=clients, samples=[{**p, "rx":p["tx"], "tx":p["rx"]} for p in samples]))
         return web.json_response(dict(servers=servers, monthly_since=self.store.get_pref('monthly_since'), build=build_info(), access={'owner':request['uid']==self.settings.admin_id}, demo=False))
@@ -540,7 +608,8 @@ class MiniApp:
         name = body.get('name')
         if not isinstance(name, str):
             raise ManagerError('Введите имя клиента.')
-        c = await self.service.create_client(int(request.match_info['sid']), name, duration, limit, rate)
+        options = {'endpoint': body['endpoint']} if body.get('endpoint') is not None else {}
+        c = await self.service.create_client(int(request.match_info['sid']), name, duration, limit, rate, **options)
         if rate:
             try:
                 await self.service.apply_speed(int(request.match_info['sid']))
@@ -586,9 +655,17 @@ class MiniApp:
         body = await request.json()
         if not isinstance(body, dict):
             raise ManagerError('Подтвердите перевыпуск конфига.')
-        c = await self.controller(request,'reissue').execute(int(request.match_info['sid']), int(request.match_info['cid']), body.get('nonce'))
+        c = await self.controller(request,'reissue').execute(int(request.match_info['sid']), int(request.match_info['cid']), body.get('nonce'), body.get('endpoint'))
         self.last_refresh = 0
         return web.json_response({'config': c['config'], 'name': c['name']})
+
+    async def change_client_endpoint(self, request):
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get('endpoint'), str):
+            raise ManagerError('Выберите адрес из настроек сервера.')
+        sid, cid = int(request.match_info['sid']), int(request.match_info['cid'])
+        client = await self.service.change_client_endpoint(sid, cid, body['endpoint'])
+        return web.json_response({'config_endpoint': client['config_endpoint']})
 
     async def config(self, request):
         c = self.store.client(int(request.match_info['sid']), int(request.match_info['cid']))
@@ -602,8 +679,17 @@ class MiniApp:
             key = None  # an unusual config still opens as text and .conf
         return web.json_response({'config': c['config'], 'vpn': key})
 
+    async def config_qr(self, request):
+        sid, cid = int(request.match_info['sid']), int(request.match_info['cid'])
+        client = self.store.client(sid, cid)
+        if not client['config']:
+            raise ManagerError('Приватный ключ этого клиента не сохранён в боте.')
+        from .config_qr import config_qr_png
+        png = await self.service.worker(lambda: config_qr_png(client['config']))
+        return web.json_response({'png': base64.b64encode(png).decode('ascii')})
 
-    async def send_config(self, request):
+
+    async def config_document(self, request):
         sid, cid = int(request.match_info['sid']), int(request.match_info['cid'])
         body = await request.json()
         kind = body.get('format') if isinstance(body, dict) else None
@@ -624,11 +710,41 @@ class MiniApp:
             document = BufferedInputFile(key.encode(), filename=f'{name}.vpn')
         else:
             document = BufferedInputFile(raw, filename=f'{name}.conf')
+        return document, escape(c['name'])
+
+    async def send_config(self, request):
+        document, caption = await self.config_document(request)
         try:
-            await asyncio.wait_for(self.bot.send_document(request['uid'], document, caption=escape(c['name'])), 15)
+            await asyncio.wait_for(self.bot.send_document(request['uid'], document, caption=caption), 15)
         except (TelegramAPIError, asyncio.TimeoutError):
             raise ManagerError('Не удалось отправить файл. Откройте чат с ботом и нажмите /start.')
         return web.json_response({'ok': True})
+
+    async def prepare_config_share(self, request):
+        from aiogram.types import InlineQueryResultCachedDocument
+
+        document, caption = await self.config_document(request)
+        uid = request['uid']
+        try:
+            message = await asyncio.wait_for(
+                self.bot.send_document(uid, document, disable_notification=True), 12)
+            try:
+                prepared = await asyncio.wait_for(self.bot.save_prepared_inline_message(
+                    user_id=uid,
+                    result=InlineQueryResultCachedDocument(
+                        id=secrets.token_hex(16), title=document.filename,
+                        document_file_id=message.document.file_id, caption=caption,
+                    ),
+                    allow_user_chats=True, allow_group_chats=True,
+                ), 12)
+            finally:
+                try:
+                    await asyncio.wait_for(self.bot.delete_message(uid, message.message_id), 3)
+                except (TelegramAPIError, asyncio.TimeoutError):
+                    log.warning('Не удалось удалить временное сообщение с конфигом.')
+        except (TelegramAPIError, asyncio.TimeoutError):
+            raise ManagerError('Не удалось подготовить файл для Telegram.') from None
+        return web.json_response({'message_id': prepared.id})
 
 
 def create_web_app(settings, store, service, bot=None):
@@ -670,7 +786,7 @@ def create_web_app(settings, store, service, bot=None):
             log.error('Mini App failure: request=%s operation=%s server=%s type=%s',request_id,operation,request.match_info.get('sid'),error)
             response = web.json_response({'error': 'Не удалось выполнить запрос. Обновите данные и повторите.'}, status=500)
         try:
-            if token is not None and (request.method in {'POST','PATCH','DELETE'} or operation.endswith('/config')) and not operation.endswith('/preferences'):
+            if token is not None and (request.method in {'POST','PATCH','DELETE'} or operation.endswith(('/config', '/config/qr'))) and not operation.endswith('/preferences'):
                 audit.record(store,operation,'accepted' if response.status==202 else 'ok' if response.status<400 else 'failed',int(request.match_info['sid']) if 'sid' in request.match_info else None,int(request.match_info['cid']) if 'cid' in request.match_info else None,error or ('HTTP'+str(response.status) if response.status>=400 else None),int((time.monotonic()-started)*1000))
         finally:
             if token is not None:audit.context.reset(token)
@@ -694,6 +810,8 @@ def create_web_app(settings, store, service, bot=None):
     app.router.add_post(r'/api/servers/{sid:\d+}/backup', api.backup)
     app.router.add_post(r'/api/servers/{sid:\d+}/reboot/prepare', api.prepare_reboot)
     app.router.add_post(r'/api/servers/{sid:\d+}/reboot', api.reboot)
+    app.router.add_post(r'/api/servers/{sid:\d+}/move/prepare', api.prepare_move)
+    app.router.add_post(r'/api/servers/{sid:\d+}/move', api.start_move)
     app.router.add_get('/api/backup-schedule', api.backup_schedule)
     app.router.add_patch('/api/backup-schedule', api.backup_schedule)
     app.router.add_get('/api/updates/changelog',api.update_changelog)
@@ -713,6 +831,8 @@ def create_web_app(settings, store, service, bot=None):
     app.router.add_patch(r'/api/admins/{uid:\d+}', api.administrators)
     app.router.add_delete(r'/api/admins/{uid:\d+}', api.administrators)
     app.router.add_post('/api/servers', api.add_server)
+    app.router.add_get(r'/api/servers/{sid:\d+}/endpoint', api.endpoint_settings)
+    app.router.add_patch(r'/api/servers/{sid:\d+}/endpoint', api.endpoint_settings)
     app.router.add_get(r'/api/servers/{sid:\d+}/speedtest', api.speedtest)
     app.router.add_post(r'/api/servers/{sid:\d+}/speedtest', api.speedtest)
     host_task = backup_task = None
@@ -754,9 +874,12 @@ def create_web_app(settings, store, service, bot=None):
     app.router.add_delete(r'/api/servers/{sid:\d+}/clients/{cid:\d+}', api.delete)
     app.router.add_patch(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/policy', api.set_policy)
     app.router.add_get(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/config', api.config)
+    app.router.add_get(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/config/qr', api.config_qr)
     app.router.add_post(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/config/send', api.send_config)
+    app.router.add_post(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/config/share', api.prepare_config_share)
     app.router.add_post(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/reissue/prepare', api.prepare_reissue)
     app.router.add_post(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/reissue', api.reissue)
+    app.router.add_patch(r'/api/servers/{sid:\d+}/clients/{cid:\d+}/endpoint', api.change_client_endpoint)
     return app
 
 

@@ -25,6 +25,9 @@ class Server:
     config_path: str = "/opt/amnezia/awg/wg0.conf"
     endpoint: str = ""
     local: bool = False
+    endpoint_ip: str = ""
+    endpoint_dns: str = ""
+    endpoints: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass

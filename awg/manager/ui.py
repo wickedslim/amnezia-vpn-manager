@@ -19,6 +19,7 @@ from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from .access import Access
 from .amnezia_key import vpn_key
+from .endpoints import configure_endpoints, endpoint_choices
 from .domain import ManagerError, Server, validate_name
 from .service import VPNService
 from .reissue import Reissues
@@ -264,7 +265,11 @@ class UI:
         if self.access.permits(self.admin_id, sid, 'pause'):
             pause_button = [("Возобновить доступ" if paused else "Приостановить доступ",
                              f"{'resume' if paused else 'pause'}:{sid}:{cid}")]
-        await self.panel(client_text(server.name, client) + ("\n\n⏸ Доступ приостановлен" if paused else ""), keyboard(pause_button, [("Получить конфигурацию", f"conf:{sid}:{cid}")], [("Перевыпустить конфиг", f"reissue:{sid}:{cid}")], [("↻ Обновить", f"cr:{sid}:{cid}"), ("Лимиты и срок", f"policy:{sid}:{cid}")], [("IP подключения", f"ip:{sid}:{cid}"), ("Удалить", f"delete:{sid}:{cid}")], [("‹ Клиенты", f"list:{sid}:0"), ("⌂ Главная", "home")]), revision)
+        change_address = [("Сменить адрес", f"changeaddr:{sid}:{cid}")] if client.get('config_endpoint') and endpoint_choices(server) else []
+        config_buttons = [("Получить конфигурацию", f"conf:{sid}:{cid}")]
+        if client.get('config'):
+            config_buttons.append(("QR-код", f"configqr:{sid}:{cid}"))
+        await self.panel(client_text(server.name, client) + ("\n\n⏸ Доступ приостановлен" if paused else ""), keyboard(pause_button, config_buttons, change_address, [("Перевыпустить конфиг", f"reissue:{sid}:{cid}")], [("↻ Обновить", f"cr:{sid}:{cid}"), ("Лимиты и срок", f"policy:{sid}:{cid}")], [("IP подключения", f"ip:{sid}:{cid}"), ("Удалить", f"delete:{sid}:{cid}")], [("‹ Клиенты", f"list:{sid}:0"), ("⌂ Главная", "home")]), revision)
 
     async def callback(self, call: CallbackQuery):
         self.revision += 1
@@ -272,10 +277,10 @@ class UI:
         parts = call.data.split(":")
         action = parts[0]
         try:
-            if action in {"newserver","editserver","settings","unlink","unlinkyes","backup"}:self.access.require_owner(self.admin_id)
+            if action in {"newserver","editserver","settings","unlink","unlinkyes","backup","editaddresses"}:self.access.require_owner(self.admin_id)
             if action in {"s","sr","list","lr","c","cr","months","report","csv","newclient",
-                          "policy","search","reissue","reissueyes","delete","deleteyes","conf","ip","pause","resume","widget"}:
-                operation = {"reissue":"reissue","reissueyes":"reissue","delete":"delete","deleteyes":"delete",
+                          "policy","search","reissue","reissueyes","reissueaddr","changeaddr","delete","deleteyes","conf","configqr","ip","pause","resume","widget"}:
+                operation = {"reissue":"reissue","reissueyes":"reissue","reissueaddr":"reissue","delete":"delete","deleteyes":"delete",
                              "pause":"pause","resume":"pause","policy":"delete"}.get(action)
                 if not self.access.permits(self.admin_id, int(parts[1]), operation):
                     raise ManagerError("Недостаточно прав для этого действия.")
@@ -305,7 +310,7 @@ class UI:
                 await self.begin({"kind": "server", "step": "name"})
             elif action == "editserver":
                 s = self.store.server(int(parts[1]))
-                await self.begin({"kind": "server", "step": "name", "edit_sid": s.id, "name": s.name, "host": s.host, "port": s.port, "username": s.username, "endpoint": s.endpoint, "local": s.local, "container": s.container, "config_path": s.config_path})
+                await self.begin({"kind": "server", "step": "name", "edit_sid": s.id, "name": s.name, "host": s.host, "port": s.port, "username": s.username, "endpoint": s.endpoint, "keep_delivery": bool(s.endpoints), "local": s.local, "container": s.container, "config_path": s.config_path})
             elif action in {"newclient", "policy"}:
                 sid = int(parts[1])
                 self.store.server(sid)
@@ -319,7 +324,10 @@ class UI:
                 await self.begin({"kind": "search", "step": "query", "sid": int(parts[1])})
             elif action == "settings":
                 s = self.store.server(int(parts[1]))
-                await self.panel(f"<b>{e(s.name)} › Настройки</b>\n\nПодключение: <code>{e('локально' if s.local else f'{s.username}@{s.host}:{s.port}')}</code>\nКонтейнер: <code>{e(s.container)}</code>\nКонфигурация: <code>{e(s.config_path)}</code>\nАдрес VPN: <code>{e(s.endpoint)}</code>\n\nОтключение от бота сохраняет клиентов на VPN-сервере.", keyboard([("Изменить подключение", f"editserver:{s.id}")], [("Отключить от бота", f"unlink:{s.id}")], [("‹ Сервер", f"s:{s.id}")]), revision)
+                await self.panel(f"<b>{e(s.name)} › Настройки</b>\n\nПодключение: <code>{e('локально' if s.local else f'{s.username}@{s.host}:{s.port}')}</code>\nКонтейнер: <code>{e(s.container)}</code>\nКонфигурация: <code>{e(s.config_path)}</code>\nАдрес VPN: <code>{e(s.endpoint)}</code>\n\nОтключение от бота сохраняет клиентов на VPN-сервере.", keyboard([("Адреса выдачи", f"editaddresses:{s.id}")], [("Изменить подключение", f"editserver:{s.id}")], [("Отключить от бота", f"unlink:{s.id}")], [("‹ Сервер", f"s:{s.id}")]), revision)
+            elif action == "editaddresses":
+                sid = int(parts[1])
+                await self.begin({"kind":"endpoint_list", "sid":sid, "step":"addresses"})
             elif action == "unlink":
                 s = self.store.server(int(parts[1]))
                 await self.panel(f"<b>Отключить {e(s.name)} от бота?</b>\n\nVPN продолжит работать. Клиенты и конфигурация на сервере сохранятся. Учёт трафика и ограничений этим ботом прекратится.\n\nРекомендуется сначала скачать резервную копию.", keyboard([("Скачать копию", f"backup:{s.id}")], [("Да, отключить", f"unlinkyes:{s.id}")], [("‹ Отмена", f"s:{s.id}")]), revision)
@@ -329,7 +337,19 @@ class UI:
             elif action == "reissue":
                 sid, cid = map(int, parts[1:3])
                 confirmation = self.reissues.prepare(sid, cid)
-                await self.panel(f"<b>Перевыпустить конфиг?</b>\n\nСервер: {e(confirmation['server'])}\nКлиент: <b>{e(confirmation['name'])}</b>\n\nСтарый конфиг перестанет работать. Имя, VPN-адрес, лимиты, срок и статистика сохранятся. Новый файл можно будет скачать повторно без перевыпуска.", keyboard([("Перевыпустить", f"reissueyes:{sid}:{cid}:{confirmation['nonce']}")], [("Отмена", f"c:{sid}:{cid}")]), revision)
+                alternatives = [row for row in endpoint_choices(self.store.server(sid)) if row['address'] != confirmation['endpoint']]
+                change = [("Выбрать адрес", f"reissueaddr:{sid}:{cid}")] if alternatives else []
+                await self.panel(f"<b>Перевыпустить конфиг?</b>\n\nСервер: {e(confirmation['server'])}\nКлиент: <b>{e(confirmation['name'])}</b>\nАдрес подключения: <code>{e(confirmation['endpoint'] or self.store.server(sid).endpoint)}</code>\n\nСтарый конфиг перестанет работать. Имя, VPN-адрес, лимиты, срок и статистика сохранятся. Новый файл можно будет скачать повторно без перевыпуска.", keyboard([("Перевыпустить", f"reissueyes:{sid}:{cid}:{confirmation['nonce']}")], change, [("Отмена", f"c:{sid}:{cid}")]), revision)
+            elif action in {"changeaddr", "reissueaddr"}:
+                sid, cid = map(int, parts[1:3])
+                client = self.store.client(sid, cid)
+                if action == "changeaddr" and not client.get('config_endpoint'):
+                    raise ManagerError('У клиента нет сохранённого конфига с адресом подключения.')
+                wizard = {"kind": action, "sid": sid, "cid": cid, "step": "delivery",
+                          "addresses": endpoint_choices(self.store.server(sid))}
+                if action == "reissueaddr":
+                    wizard['confirmation'] = self.reissues.prepare(sid, cid)['nonce']
+                await self.begin(wizard)
             elif action == "reissueyes":
                 sid, cid = map(int, parts[1:3])
                 client = await self.reissues.execute(sid, cid, parts[3])
@@ -353,17 +373,17 @@ class UI:
                 sid, cid = map(int, parts[1:3])
                 await self.service.snapshot(sid)
                 client = self.store.client(sid, cid)
-                text = client["config"]
-                if not text:
-                    raise ManagerError("Сохранённого конфига пока нет. Нажмите «Перевыпустить конфиг»: новый файл сохранится для повторной выдачи, старый перестанет работать.")
-                filename = re.sub(r"[^\w.-]", "_", client["name"])[:40] or str(cid)
-                await self.bot.send_document(self.admin_id, BufferedInputFile(text.encode(), filename=f"{filename}.conf"), caption=f"{e(self.store.server(sid).name)} · {e(client['name'])}")
-                audit.record(self.store,'config.download','ok',sid,cid)
-                try:
-                    vpn = vpn_key(text, self.store.server(sid).name, client["public_key"])
-                except ManagerError:
-                    return  # the .conf above is enough for an unusual config
-                await self.bot.send_document(self.admin_id, BufferedInputFile(vpn.encode(), filename=f"{filename}.vpn"), caption="Для приложения AmneziaVPN")
+                await self.send_saved_config(sid, cid, client)
+            elif action == "configqr":
+                from .config_qr import config_qr_png
+                sid, cid = map(int, parts[1:3])
+                client = self.store.client(sid, cid)
+                if not client['config']:
+                    raise ManagerError('У клиента нет сохранённого конфига.')
+                png = await asyncio.to_thread(config_qr_png, client['config'])
+                await self.bot.send_photo(self.admin_id, BufferedInputFile(png, filename="vpn-config.png"),
+                                          caption=f"{e(client['name'])} · QR-код конфигурации AmneziaWG")
+                audit.record(self.store, 'config.download', 'ok', sid, cid)
             elif action == "backup":
                 sid = int(parts[1])
                 await send_backup(self.bot, self.service, self.admin_id, sid)
@@ -414,8 +434,22 @@ class UI:
         recent = "\n".join(f"<code>{e(row['endpoint'])}</code> · {ago(row['ts'])}" for row in history[:5])
         await self.panel(f"<b>{e(c['name'])} › IP подключения</b>\n\n<code>{e(str(address))}</code>{details}\n\nПоследнее соединение: {ago(c['handshake'])}\n\n<b>Последние адреса</b>\n{recent}", keyboard([("‹ Клиент", f"c:{sid}:{cid}")]), revision)
 
+    async def send_saved_config(self, sid, cid, client):
+        text = client["config"]
+        if not text:
+            raise ManagerError("Сохранённого конфига пока нет. Нажмите «Перевыпустить конфиг»: новый файл сохранится для повторной выдачи, старый перестанет работать.")
+        filename = re.sub(r"[^\w.-]", "_", client["name"])[:40] or str(cid)
+        await self.bot.send_document(self.admin_id, BufferedInputFile(text.encode(), filename=f"{filename}.conf"), caption=f"{e(self.store.server(sid).name)} · {e(client['name'])}")
+        audit.record(self.store,'config.download','ok',sid,cid)
+        try:
+            vpn = vpn_key(text, self.store.server(sid).name, client["public_key"])
+        except ManagerError:
+            return  # the .conf above is enough for an unusual config
+        await self.bot.send_document(self.admin_id, BufferedInputFile(vpn.encode(), filename=f"{filename}.vpn"), caption="Для приложения AmneziaVPN")
+
     async def begin(self, wizard):
-        if wizard.get("kind")=="server":self.access.require_owner(self.admin_id)
+        if wizard["kind"] in {"server", "endpoint_list"}:
+            self.access.require_owner(self.admin_id)
         wizard.update(nonce=secrets.token_hex(4), history=[])
         self.store.set_wizard(self.admin_id, wizard)
         await self.show_wizard(wizard)
@@ -449,11 +483,34 @@ class UI:
             if step == "review":
                 rows += [[button("✓ Проверить и подключить", "save")], [button("Параметры контейнера", "advanced")]]
             text = prompts.get(step, prompts["review"])
+        elif kind == "endpoint_list":
+            server = self.store.server(w["sid"])
+            if step == "addresses":
+                lines = '\n'.join(f"{row['label']} | {row['address']}" if row['label'] else row['address']
+                                  for row in endpoint_choices(server))
+                text = (f"<b>{e(server.name)} › Адреса выдачи</b>\n\n"
+                        f"Текущий адрес по умолчанию: <code>{e(server.endpoint)}</code>\n<pre>{e(lines)}</pre>\n"
+                        "Отправьте новый список, по одному адресу в строке. Формат: <code>Подпись | IP или домен</code>. Подпись можно опустить.")
+            else:
+                text = "<b>Адрес по умолчанию</b>\n\nВыберите адрес, который будет предлагаться первым."
+                rows += self.address_buttons(button, w["addresses"], server.endpoint, "defaultaddr")
+        elif kind in {"changeaddr", "reissueaddr"}:
+            if step == "review":
+                verb = "Перевыпустить конфиг" if kind == "reissueaddr" else "Сменить адрес"
+                effect = "Старый ключ перестанет работать." if kind == "reissueaddr" else "Ключи сохранятся. Импортируйте обновлённый файл на устройство."
+                text = f"<b>{verb}</b>\n\nАдрес подключения: <code>{e(w['delivery'])}</code>\n{effect}"
+                rows.append([button(verb, "saveaddr")])
+            else:
+                text = "<b>Адрес подключения</b>\n\nВыберите IP или домен для конфига."
+                rows += self.address_buttons(button, w["addresses"], w.get("delivery", ""), "delivery")
         elif kind in {"client", "policy"}:
             server = self.store.server(w["sid"])
             title = f"<b>{e(server.name)} › {'Новый клиент' if kind == 'client' else 'Лимиты клиента'}</b>"
             if step == "name":
-                text = title + "\n\n<b>Шаг 1/4 · Имя</b>\nОтправьте имя клиента. Допускаются пробелы, точки и подчёркивания."
+                text = title + "\n\n<b>Имя</b>\nОтправьте имя клиента. Допускаются пробелы, точки и подчёркивания."
+            elif step == "delivery":
+                text = title + "\n\n<b>Адрес подключения</b>\nВыберите IP или домен."
+                rows += self.address_buttons(button, w["addresses"], w.get("delivery", server.endpoint), "delivery")
             elif step == "duration":
                 text = title + f"\n\n<b>{e(w.get('name', ''))} · Срок действия</b>\nВыберите срок. Он начнётся после сохранения."
                 rows += [[button(label, f"duration={value}")] for label, value in DURATIONS]
@@ -476,12 +533,28 @@ class UI:
                 rows.append([button("Отмена", "cancel")])
         await self.panel(text, keyboard(*rows))
 
+    @staticmethod
+    def address_buttons(button, addresses, selected, action):
+        rows = []
+        for index, row in enumerate(addresses):
+            label = f"{row['label']} · " if row['label'] else ''
+            mark = '✓ ' if row['address'] == selected else ''
+            rows.append([button(f"{mark}{label}{row['address']}"[:64], f"{action}={index}")])
+        return rows
+
+    def check_address_wizard_access(self, wizard):
+        kind = wizard['kind']
+        if kind in {'server', 'endpoint_list'}:
+            self.access.require_owner(self.admin_id)
+        operation = {'policy':'delete', 'reissueaddr':'reissue'}.get(kind)
+        if 'sid' in wizard and not self.access.permits(self.admin_id, wizard['sid'], operation):
+            raise ManagerError('Доступ к серверу отозван.')
+
     async def wizard_action(self, parts):
         w = self.store.wizard(self.admin_id)
-        if w and 'sid' in w and not self.access.permits(self.admin_id, w['sid'], 'delete' if w['kind']=='policy' else None):
-            raise ManagerError('Доступ к серверу отозван.')
         if len(parts) != 3 or not w or w["nonce"] != parts[1]:
             raise ManagerError("Этот шаг уже закрыт. Начните добавление заново.")
+        self.check_address_wizard_access(w)
         action = parts[2]
         if w["step"] == "saving":
             return
@@ -497,7 +570,7 @@ class UI:
             self.store.set_wizard(self.admin_id, w)
         elif action == "local" and w["kind"] == "server" and w["step"] == "connect":
             w.update(local=True, host="", port=22, username="", auth_type="local")
-            self.advance(w, "endpoint")
+            self.advance(w, "review" if w.get("keep_delivery") else "endpoint")
         elif action == "key" and w["step"] == "auth":
             self.advance(w, "key")
         elif action == "samehost" and w["step"] == "endpoint":
@@ -505,6 +578,33 @@ class UI:
             self.advance(w, "review")
         elif action == "advanced" and w["step"] == "review" and w["kind"] == "server":
             self.advance(w, "advanced")
+        elif w["step"] in {"delivery", "defaultaddr"} and action.startswith(w["step"] + "="):
+            index = int(action.split("=", 1)[1])
+            if not 0 <= index < len(w["addresses"]):
+                raise ManagerError('Адрес не найден. Откройте список заново.')
+            address = w["addresses"][index]["address"]
+            if w["step"] == "defaultaddr":
+                sid = w["sid"]
+                async with self.service.lock(sid):
+                    server = configure_endpoints(self.store.server(sid), w["addresses"], address)
+                    self.store.update_server(server)
+                audit.record(self.store, 'server.endpoint', 'ok', sid)
+                self.store.clear_wizard(self.admin_id, w["nonce"])
+                await self.panel("Адреса выдачи сохранены.", keyboard([("‹ Сервер", f"s:{sid}")]))
+                return
+            w["delivery"] = address
+            self.advance(w, "duration" if w["kind"] == "client" else "review")
+        elif action == "saveaddr" and w["step"] == "review" and w["kind"] in {"changeaddr", "reissueaddr"}:
+            sid, cid = w["sid"], w["cid"]
+            if w["kind"] == "reissueaddr":
+                client = await self.reissues.execute(sid, cid, w["confirmation"], w["delivery"])
+            else:
+                client = await self.service.change_client_endpoint(sid, cid, w["delivery"])
+            self.store.clear_wizard(self.admin_id, w["nonce"])
+            await self.send_saved_config(sid, cid, client)
+            await self.panel("Конфиг обновлён. Импортируйте новый файл на устройство.",
+                             keyboard([("QR-код", f"configqr:{sid}:{cid}")], [("‹ Клиент", f"c:{sid}:{cid}")]))
+            return
         elif action.startswith("duration=") and w["step"] == "duration":
             value = action.split("=", 1)[1]
             if value not in dict((v, k) for k, v in DURATIONS):
@@ -530,26 +630,40 @@ class UI:
             if not w:
                 await message.answer("Используйте кнопки меню. /servers — открыть серверы; /start — продолжить настройку.")
                 return
-            if 'sid' in w and not self.access.permits(self.admin_id, w['sid'], 'delete' if w['kind']=='policy' else None):
-                self.store.clear_wizard(self.admin_id)
-                await message.answer('Доступ к серверу отозван.')
-                return
             if not message.text:
                 await message.answer("На этом шаге нужен текст. /cancel — отменить ввод.")
                 return
             value = message.text.strip()
             try:
+                self.check_address_wizard_access(w)
                 step = w["step"]
                 if w["kind"] == "search":
                     query = validate_name(value)
                     self.store.clear_wizard(self.admin_id)
                     await self.clients(w["sid"], query=query, revision=self.revision)
                     return
-                if step == "name":
+                if step == "addresses" and w["kind"] == "endpoint_list":
+                    rows = []
+                    for line in value.splitlines():
+                        if line.strip():
+                            label, separator, address = line.partition('|')
+                            rows.append({'label': label.strip() if separator else '',
+                                         'address': (address if separator else label).strip()})
+                    server = self.store.server(w["sid"])
+                    proposed = configure_endpoints(server, rows, rows[0]['address'] if rows else '')
+                    w["addresses"] = proposed.endpoints
+                    self.advance(w, "defaultaddr")
+                elif step == "name":
                     w["name"] = validate_name(value)
                     if w["kind"] == "server" and any(s.id != w.get("edit_sid") and s.name.casefold() == w["name"].casefold() for s in self.store.servers()):
                         raise ManagerError("Сервер с таким названием уже есть.")
-                    self.advance(w, "connect" if w["kind"] == "server" else "duration")
+                    if w["kind"] == "client":
+                        w["addresses"] = endpoint_choices(self.store.server(w["sid"]))
+                        w.pop("delivery", None)
+                    next_step = "connect" if w["kind"] == "server" else "duration"
+                    if w["kind"] == "client" and len(w["addresses"]) > 1:
+                        next_step = "delivery"
+                    self.advance(w, next_step)
                 elif step == "connect":
                     host, port, user = connection(value)
                     w.update(host=host, port=port, username=user, local=False)
@@ -563,13 +677,13 @@ class UI:
                         await self.show_wizard(w)
                         return
                     w.update(password=message.text, auth_type="password", key_path=None)
-                    self.advance(w, "endpoint")
+                    self.advance(w, "review" if w.get("keep_delivery") else "endpoint")
                 elif step == "key":
                     path = Path(value).expanduser()
                     if not path.is_absolute() or not path.is_file():
                         raise ManagerError("Файл ключа не найден на машине с ботом. Укажите полный путь.")
                     w.update(key_path=str(path), auth_type="key", password=None)
-                    self.advance(w, "endpoint")
+                    self.advance(w, "review" if w.get("keep_delivery") else "endpoint")
                 elif step == "endpoint":
                     if not re.fullmatch(r"[a-zA-Z0-9.:_-]+", value) or len(value) > 253:
                         raise ManagerError("Отправьте IP или домен без протокола и порта.")
@@ -617,7 +731,8 @@ class UI:
                 if not self.access.permits(self.admin_id, sid, 'delete' if w['kind']=='policy' else None):
                     raise ManagerError('Недостаточно прав для этого действия.')
                 if w["kind"] == "client":
-                    client = await self.service.create_client(sid, w["name"], w.get("duration"), w.get("limit"))
+                    options = {"endpoint": w["delivery"]} if w.get("delivery") else {}
+                    client = await self.service.create_client(sid, w["name"], w.get("duration"), w.get("limit"), **options)
                     cid = client["id"]
                 else:
                     cid = w["cid"]

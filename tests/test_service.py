@@ -19,6 +19,39 @@ from helpers import FakeRunner, fixture
 
 
 class ServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_client_can_switch_endpoint_without_mutating_vpn_and_keep_it_on_reissue(self):
+        from manager.endpoints import configure_endpoints
+        sid = self.server.id
+        self.store.update_server(configure_endpoints(self.server, [
+            {'label':'Основной','address':'203.0.113.5'},
+            {'label':'Для МТС','address':'203.0.113.6'},
+            {'label':'IPv6','address':'2001:db8::2'},
+            {'label':'DNS','address':'vpn.example.com'},
+        ], '203.0.113.5'))
+        client = await self.service.create_client(sid, 'endpoint-client', None, None, endpoint='203.0.113.6')
+        self.assertEqual(client['config_endpoint'], '203.0.113.6:51820')
+        with patch.object(self.service, 'runner', side_effect=AssertionError('No VPN access for config edits')):
+            with self.assertRaises(ManagerError):
+                await self.service.change_client_endpoint(sid, client['id'], 'unlisted.example.com')
+            changed = await self.service.change_client_endpoint(sid, client['id'], '2001:db8::2')
+        self.assertEqual(changed['config_endpoint'], '[2001:db8::2]:51820')
+        self.assertEqual(changed['config'], client['config'].replace('Endpoint = 203.0.113.6:51820', 'Endpoint = [2001:db8::2]:51820'))
+        self.assertEqual(changed['public_key'], client['public_key'])
+        reissued = await self.service.reissue_client(sid, client['id'], client['public_key'])
+        self.assertEqual(reissued['config_endpoint'], changed['config_endpoint'])
+        self.assertNotEqual(reissued['public_key'], client['public_key'])
+        reissued = await self.service.reissue_client(sid, client['id'], reissued['public_key'], endpoint='vpn.example.com')
+        self.assertEqual(reissued['config_endpoint'], 'vpn.example.com:51820')
+
+    async def test_delivery_switch_affects_new_configs_but_keeps_issued_one(self):
+        from manager.endpoints import configure
+        sid=self.server.id
+        first=await self.service.create_client(sid,'before-switch',None,None)
+        self.store.update_server(configure(self.store.server(sid),{'mode':'dns','ip':'203.0.113.5','dns':'vpn.example.com'}))
+        second=await self.service.create_client(sid,'after-switch',None,None)
+        self.assertIn('Endpoint = vpn.example.com:',second['config'])
+        self.assertEqual(self.store.client(sid,first['id'])['config'],first['config'])
+
     async def asyncSetUp(self):
         self.tmp = TemporaryDirectory()
         self.root = Path(self.tmp.name)

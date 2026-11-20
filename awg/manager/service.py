@@ -11,11 +11,12 @@ import re
 import tempfile
 import time
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .domain import ManagerError, Server, WGConfig, allocate_address, client_config, fields, Peer, parse_config, parse_dump, validate_key, validate_name
 from .audit import audited
+from .endpoints import choose_endpoint, config_endpoint, config_host, replace_config_endpoint
 from . import shaping
 from .store import Store
 from .transport import Runner, WG_SELECT, q, read_snapshot, write_peer
@@ -372,16 +373,16 @@ class VPNService:
         return dict(await asyncio.gather(*(one(s) for s in self.store.servers())))
 
     @audited('client.create')
-    async def create_client(self, sid: int, name: str, duration: int | None, limit: int | None, speed: int | None = None) -> dict:
+    async def create_client(self, sid: int, name: str, duration: int | None, limit: int | None,
+                            speed: int | None = None, *, endpoint: str | None = None) -> dict:
         name = validate_name(name)
         async with self.lock(sid):
             def operation():
+                server = self.store.server(sid)
+                address_to_issue = choose_endpoint(server, endpoint)
                 snapshot = self._read(sid)
                 if any(p.name.casefold() == name.casefold() for p in snapshot.config.peers):
                     raise ManagerError("Клиент с таким именем на этом сервере уже есть.")
-                server = self.store.server(sid)
-                if not server.endpoint:
-                    raise ManagerError("У сервера не задан внешний адрес для клиентской конфигурации.")
                 runner = self.runner(sid)
                 script = f"""set -eu
 {WG_SELECT}
@@ -398,10 +399,11 @@ printf '%s\\n' "$private" | "$WG" pubkey
                             for key, item in self.paused(sid).items()]
                 address = allocate_address(WGConfig(snapshot.config.header, snapshot.config.interface,
                                                      snapshot.config.peers + reserved))
-                generated = client_config(snapshot.config, address, private, snapshot.server_public, psk, server.endpoint)
+                generated = client_config(snapshot.config, address, private, snapshot.server_public, psk, address_to_issue)
                 # Persist the private key before touching the remote server.
                 with self.store.transaction() as conn:
-                    cursor = conn.execute("INSERT INTO clients(server_id,public_key,name,allowed_ips,config,expires,traffic_limit,speed_limit,present) VALUES (?,?,?,?,?,?,?,?,0)", (sid, public, name, address, generated, int(time.time()) + duration if duration else None, limit, speed))
+                    cursor = conn.execute("INSERT INTO clients(server_id,public_key,name,allowed_ips,config,config_endpoint,expires,traffic_limit,speed_limit,present) VALUES (?,?,?,?,?,?,?,?,?,0)",
+                                          (sid, public, name, address, generated, config_endpoint(generated), int(time.time()) + duration if duration else None, limit, speed))
                     cid = cursor.lastrowid
                 block = f"[Peer]\n# {name}\nPublicKey = {public}\nPresharedKey = {psk}\nAllowedIPs = {address}\n"
                 peer = Peer(public, name, address, block)
@@ -571,7 +573,7 @@ printf '%s\\n' "$private" | "$WG" pubkey
             self.cache.pop(sid, None)
 
     @audited('client.reissue')
-    async def reissue_client(self, sid: int, cid: int, expected_key: str) -> dict:
+    async def reissue_client(self, sid: int, cid: int, expected_key: str, *, endpoint: str | None = None) -> dict:
         async with self.lock(sid):
             def operation():
                 snapshot = self._read(sid)
@@ -585,8 +587,7 @@ printf '%s\\n' "$private" | "$WG" pubkey
                 if not peer:
                     raise ManagerError('Возобновите доступ перед перевыпуском конфига.')
                 server = self.store.server(sid)
-                if not server.endpoint:
-                    raise ManagerError('У сервера не задан внешний адрес для клиентской конфигурации.')
+                address_to_issue = choose_endpoint(server, endpoint, config_host(client['config']))
                 runner = self.runner(sid)
                 keys = runner.docker(f"""set -eu
 {WG_SELECT}
@@ -598,7 +599,7 @@ printf '%s\\n' "$private" | "$WG" pubkey
                 if len(keys) != 3:
                     raise ManagerError('Не удалось сгенерировать ключи клиента.')
                 private, public, psk = map(validate_key, keys)
-                generated = client_config(snapshot.config, peer.allowed_ips, private, snapshot.server_public, psk, server.endpoint)
+                generated = client_config(snapshot.config, peer.allowed_ips, private, snapshot.server_public, psk, address_to_issue)
                 # Keep all peer options, replacing only its cryptographic identity.
                 block = re.sub(r'(?m)^(\s*PublicKey\s*=)[^\n]*', lambda m: m[1] + ' ' + public, peer.block)
                 block = re.sub(r'(?m)^\s*PresharedKey\s*=[^\n]*\n?', '', block)
@@ -618,9 +619,28 @@ printf '%s\\n' "$private" | "$WG" pubkey
                 return self.store.client(sid, cid)
             return await self.worker(operation)
 
+    @audited('client.endpoint')
+    async def change_client_endpoint(self, sid: int, cid: int, endpoint: str):
+        async with self.lock(sid):
+            with self.store.transaction() as conn:
+                client = self.store.client(sid, cid)
+                if conn.execute('SELECT 1 FROM rotations WHERE client_id=?', (cid,)).fetchone():
+                    raise ManagerError('Перевыпуск ещё не завершён. Обновите карточку клиента.')
+                address = choose_endpoint(self.store.server(sid), endpoint)
+                config = replace_config_endpoint(client['config'], address)
+                self.store.save_client_config(sid, client['public_key'], config)
+            return self.store.client(sid, cid)
+
     @audited('server.update')
     async def update_server(self, server: Server):
         async with self.lock(server.id):
+            previous = self.store.server(server.id)
+            server = replace(server, endpoint_ip=server.endpoint_ip or previous.endpoint_ip,
+                             endpoint_dns=server.endpoint_dns or previous.endpoint_dns,
+                             endpoints=previous.endpoints)
+            if previous.endpoints:
+                # Connection settings and delivery settings have separate editors.
+                server = replace(server, endpoint=previous.endpoint)
             await self.probe(server)
             self.store.update_server(server)
             runner = self.runners.pop(server.id, None)

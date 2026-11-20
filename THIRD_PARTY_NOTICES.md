@@ -48,3 +48,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ```
+
+## Генерация QR-кодов
+
+В `awg/manager/_qrcodegen.py` включена неизменённая Python-реализация [Project Nayuki QR Code generator, v1.8.0](https://www.nayuki.io/page/qr-code-generator-library). Copyright (c) Project Nayuki, лицензия MIT приведена в исходном файле. Дополнительные пакеты для генерации QR не требуются.

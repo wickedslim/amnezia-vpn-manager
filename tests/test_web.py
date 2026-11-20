@@ -33,6 +33,64 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(validate_init_data(signed(extra={'signature':'example'}),'test-token',123),123)
 
 class WebTests(unittest.IsolatedAsyncioTestCase):
+    async def test_delivery_list_owner_only_and_config_endpoint_visible_to_authorized_roles(self):
+        import asyncio
+        import base64
+        sid = self.server.id
+        url = f'/api/servers/{sid}/endpoint'
+        self.service.lock = lambda _: asyncio.Lock()
+        self.store.set_pref('telegram_admins', [{'id':124,'name':'admin','servers':[sid]},
+                                               {'id':125,'name':'other','servers':[]}])
+        admin = {'Authorization':'tma '+signed(uid=124)}
+        other = {'Authorization':'tma '+signed(uid=125)}
+        body = {'default':'203.0.113.11','endpoints':[
+            {'label':'Основной','address':'203.0.113.11'}, {'label':'Для МТС','address':'203.0.113.12'},
+        ]}
+        self.assertEqual((await self.client.patch(url,headers=admin,json=body)).status,403)
+        response = await self.client.patch(url,headers=self.headers,json=body)
+        self.assertEqual(response.status,200)
+        self.assertEqual((await response.json())['default'],'203.0.113.11')
+        response = await self.client.get('/api/overview',headers=admin)
+        self.assertEqual(len((await response.json())['servers'][0]['delivery']['choices']),2)
+        cid = self.store.clients(sid)[0]['id']
+        self.store.save_client_config(sid,'public','[Peer]\nEndpoint = 203.0.113.12:42080\n')
+        path = f'/api/servers/{sid}/clients/{cid}'
+        self.service.change_client_endpoint = AsyncMock(return_value={'config_endpoint':'203.0.113.11:42080'})
+        self.assertEqual((await self.client.patch(path+'/endpoint',headers=other,json={'endpoint':'203.0.113.11'})).status,403)
+        self.service.change_client_endpoint.assert_not_awaited()
+        response = await self.client.patch(path+'/endpoint',headers=admin,json={'endpoint':'203.0.113.11'})
+        self.assertEqual(response.status,200)
+        self.service.change_client_endpoint.assert_awaited_once_with(sid,cid,'203.0.113.11')
+        self.service.worker = asyncio.to_thread
+        self.assertEqual((await self.client.get(path+'/config/qr',headers=other)).status,403)
+        response = await self.client.get(path+'/config/qr',headers=admin)
+        self.assertEqual(response.status,200)
+        self.assertTrue(base64.b64decode((await response.json())['png']).startswith(b'\x89PNG\r\n\x1a\n'))
+
+    async def test_endpoint_settings_owner_only_preserve_issued_configs(self):
+        import asyncio
+        from unittest.mock import patch
+        self.service.lock=lambda sid: asyncio.Lock()
+        url=f'/api/servers/{self.server.id}/endpoint'
+        self.store.set_pref('telegram_admins',[{'id':124,'name':'admin'}])
+        admin={'Authorization':'tma '+signed(uid=124)}
+        self.assertEqual((await self.client.get(url,headers=admin)).status,403)
+        self.assertEqual((await self.client.patch(url,headers=admin,json={'mode':'ip','ip':'1.1.1.1'})).status,403)
+        client=self.store.clients(self.server.id)[0]
+        self.store.save_client_config(self.server.id,client['public_key'],'original-issued-config')
+        with patch.dict('os.environ',{'AWG_WEB_URL':'https://panel.example.com'}):
+            response=await self.client.patch(url,headers=self.headers,json={'mode':'dns','ip':'198.51.100.7','dns':'vpn.example.com'})
+            self.assertEqual(response.status,200)
+            self.assertEqual((await response.json())['miniapp_domain'],'panel.example.com')
+        self.assertEqual(self.store.server(self.server.id).endpoint,'vpn.example.com')
+        self.assertEqual(self.store.client(self.server.id,client['id'])['config'],'original-issued-config')
+        response=await self.client.patch(url,headers=self.headers,json={'mode':'ip','ip':'198.51.100.7','dns':'vpn.example.com'})
+        self.assertEqual(response.status,200)
+        self.assertEqual((await response.json())['dns'],'vpn.example.com')
+        response=await self.client.patch(url,headers=self.headers,json={'mode':'dns','dns':'https://invalid.example'})
+        self.assertEqual(response.status,400)
+        self.assertEqual(self.store.server(self.server.id).endpoint,'198.51.100.7')
+
     async def asyncSetUp(self):
         self.tmp=TemporaryDirectory();self.store=Store(Path(self.tmp.name));self.server=self.store.add_server(Server(0,'test',host='private-host',password='secret-password'))
         self.store.sync(self.server.id,[Peer('public','client','10.0.0.2/32','',received=100,sent=200)],'server')
@@ -187,6 +245,16 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recipient,123)
         self.assertEqual(document.data,b'private archive')
 
+    async def test_move_routes_are_owner_only(self):
+        self.store.set_pref('telegram_admins', [{'id': 124, 'name': 'admin'}])
+        admin = {'Authorization': 'tma ' + signed(uid=124)}
+        base = f'/api/servers/{self.server.id}/move'
+        for path in (base + '/prepare', base):
+            response = await self.client.post(path, headers=admin, json={})
+            self.assertEqual(response.status, 403)
+        response = await self.client.post(base + '/prepare', headers=self.headers, json={'host':'192.0.2.1', 'port':22})
+        self.assertEqual(response.status, 400)
+
     async def test_updates_owner_only(self):
         self.store.set_pref('telegram_admins',[{'id':124,'name':'admin'}])
         for path in ['/api/updates','/api/updates/check','/api/updates/prepare','/api/updates/start']:
@@ -297,6 +365,45 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
             response=await self.client.post(path,headers=self.headers,json={'format':kind});self.assertEqual(response.status,200)
             self.bot.send_document.assert_awaited_once()
             self.assertTrue(self.bot.send_document.await_args.args[1].filename.endswith(suffix))
+
+    async def test_desktop_config_share_prepares_a_cached_document_for_the_signed_user(self):
+        sid = self.server.id
+        self.store.save_client_config(sid, 'public',
+            '[Interface]\nAddress = 10.0.0.2/32\nPrivateKey = x\nJc = 4\n'
+            '\n[Peer]\nPublicKey = y\nEndpoint = 203.0.113.5:443\n')
+        self.store.set_pref('telegram_admins', [{'id': 124, 'name': 'admin', 'servers': []}])
+        url = f'/api/servers/{sid}/clients/1/config/share'
+        self.bot.send_document.return_value = SimpleNamespace(
+            message_id=42, document=SimpleNamespace(file_id='telegram-file'))
+        self.bot.save_prepared_inline_message = AsyncMock(return_value=SimpleNamespace(id='prepared'))
+        self.bot.delete_message = AsyncMock()
+        self.assertEqual((await self.client.post(url, json={'format': 'conf'})).status, 401)
+        denied = {'Authorization': 'tma '+signed(uid=124)}
+        self.assertEqual((await self.client.post(url, headers=denied, json={'format': 'conf'})).status, 403)
+        self.assertEqual((await self.client.post(url, headers=self.headers, json={'format': 'zip'})).status, 400)
+        self.bot.send_document.assert_not_awaited()
+        for kind in ('conf', 'vpn'):
+            for call in (self.bot.send_document, self.bot.save_prepared_inline_message, self.bot.delete_message):
+                call.reset_mock()
+            response = await self.client.post(url, headers=self.headers,
+                                              json={'format': kind, 'user_id': 999})
+            self.assertEqual(response.status, 200)
+            self.assertEqual(await response.json(), {'message_id': 'prepared'})
+            upload = self.bot.send_document.await_args
+            self.assertEqual(upload.args[0], 123)
+            self.assertEqual(upload.args[1].filename, f'client.{kind}')
+            self.assertTrue(upload.kwargs['disable_notification'])
+            prepared = self.bot.save_prepared_inline_message.await_args.kwargs
+            self.assertEqual(prepared['user_id'], 123)
+            self.assertEqual(prepared['result'].type, 'document')
+            self.assertEqual(prepared['result'].document_file_id, 'telegram-file')
+            self.assertTrue(prepared['allow_user_chats'])
+            self.bot.delete_message.assert_awaited_once_with(123, 42)
+        self.bot.delete_message.reset_mock()
+        self.bot.save_prepared_inline_message.side_effect = asyncio.TimeoutError()
+        response = await self.client.post(url, headers=self.headers, json={'format': 'conf'})
+        self.assertEqual(response.status, 400)
+        self.bot.delete_message.assert_awaited_once_with(123, 42)
 
     async def test_preferences_authenticated_persisted_and_normalized(self):
         response=await self.client.post('/api/preferences',json={'palette':'pink'})
